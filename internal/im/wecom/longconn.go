@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	wecomWSEndpoint = "wss://openws.work.weixin.qq.com"
+	defaultWSEndpoint = "wss://openws.work.weixin.qq.com"
 
 	cmdSubscribe     = "aibot_subscribe"
 	cmdPing          = "ping"
@@ -39,6 +39,11 @@ const (
 	defaultReconnectBaseDelay   = 1 * time.Second
 	defaultReconnectMaxDelay    = 30 * time.Second
 	defaultMaxReconnectAttempts = -1 // infinite
+
+	// readTimeout is how long the receive loop waits for any message (including
+	// heartbeat pong) before treating the connection as dead. Set to 3× heartbeat
+	// interval so a single missed pong does not cause a spurious reconnect.
+	readTimeout = 3 * defaultHeartbeatInterval
 )
 
 // wsFrame is the JSON frame exchanged over the WeCom bot WebSocket.
@@ -51,12 +56,14 @@ type wsFrame struct {
 }
 
 // botMessage is the body of an aibot_msg_callback frame.
+// Supports text, image, file, voice, and mixed message types.
+// Reference: https://developer.work.weixin.qq.com/document/path/100719
 type botMessage struct {
 	MsgID      string `json:"msgid"`
 	AiBotID    string `json:"aibotid"`
 	ChatID     string `json:"chatid"`
 	ChatType   string `json:"chattype"` // "single" or "group"
-	MsgType    string `json:"msgtype"`  // "text", "image", "event", ...
+	MsgType    string `json:"msgtype"`  // "text", "image", "file", "voice", "video", "mixed", "stream"
 	CreateTime int64  `json:"create_time"`
 	From       struct {
 		UserID string `json:"userid"`
@@ -64,6 +71,40 @@ type botMessage struct {
 	Text struct {
 		Content string `json:"content"`
 	} `json:"text"`
+	Image struct {
+		URL    string `json:"url"`    // encrypted download URL, valid for 5 minutes
+		AESKey string `json:"aeskey"` // per-message AES key for decrypting downloaded content
+	} `json:"image"`
+	File struct {
+		URL    string `json:"url"`    // encrypted download URL, valid for 5 minutes
+		AESKey string `json:"aeskey"` // per-message AES key for decrypting downloaded content
+	} `json:"file"`
+	Voice struct {
+		Content string `json:"content"` // speech-to-text result
+	} `json:"voice"`
+	Video struct {
+		URL    string `json:"url"`    // encrypted download URL, valid for 5 minutes
+		AESKey string `json:"aeskey"` // per-message AES key for decrypting downloaded content
+	} `json:"video"`
+	Mixed struct {
+		MsgItem []botMixedItem `json:"msg_item"`
+	} `json:"mixed"`
+	Quote *botMessage `json:"quote,omitempty"` // quoted message (optional)
+	Event struct {
+		EventType string `json:"eventtype"`
+	} `json:"event"`
+}
+
+// botMixedItem is one element in a mixed (text+image) message.
+type botMixedItem struct {
+	MsgType string `json:"msgtype"` // "text" or "image"
+	Text    struct {
+		Content string `json:"content"`
+	} `json:"text"`
+	Image struct {
+		URL    string `json:"url"`
+		AESKey string `json:"aeskey"`
+	} `json:"image"`
 }
 
 // streamReplyBody is the body for a streaming text reply.
@@ -81,9 +122,11 @@ type MessageHandler func(ctx context.Context, msg *im.IncomingMessage) error
 
 // LongConnClient manages a WeCom intelligent bot WebSocket long connection.
 type LongConnClient struct {
-	botID   string
-	secret  string
-	handler MessageHandler
+	botID            string
+	secret           string
+	endpoint         string
+	extraAllowedHost string // hostname from custom endpoint for SSRF allowlist
+	handler          MessageHandler
 
 	conn   *ws.Conn
 	mu     sync.Mutex
@@ -95,15 +138,34 @@ type LongConnClient struct {
 	// the previously displayed text, so we must send the full accumulated text.
 	streamBufsMu sync.Mutex
 	streamBufs   map[string]*strings.Builder
+
+	// botDisplayName caches the bot's display name for @mention stripping.
+	// Set from credentials "bot_name", or learned from double-space messages.
+	botDisplayName atomic.Value // string
 }
 
 // NewLongConnClient creates a WeCom long connection client.
-func NewLongConnClient(botID, secret string, handler MessageHandler) *LongConnClient {
-	return &LongConnClient{
-		botID:   botID,
-		secret:  secret,
-		handler: handler,
+// wsEndpoint overrides the default WebSocket URL; empty uses the public cloud endpoint.
+// botName is the bot's display name for @mention stripping; empty to auto-detect.
+func NewLongConnClient(botID, secret, wsEndpoint, botName string, handler MessageHandler) (*LongConnClient, error) {
+	if wsEndpoint == "" {
+		wsEndpoint = defaultWSEndpoint
 	}
+	wsEndpoint = strings.TrimRight(wsEndpoint, "/")
+	if err := validateEndpointURL(wsEndpoint, defaultWSEndpoint, "wss"); err != nil {
+		return nil, fmt.Errorf("invalid ws_endpoint: %w", err)
+	}
+	c := &LongConnClient{
+		botID:            botID,
+		secret:           secret,
+		endpoint:         wsEndpoint,
+		extraAllowedHost: extraHostFromEndpoint(wsEndpoint, defaultWSEndpoint),
+		handler:          handler,
+	}
+	if botName != "" {
+		c.botDisplayName.Store(botName)
+	}
+	return c, nil
 }
 
 // Start connects and runs the long connection loop. It reconnects automatically on failure.
@@ -116,12 +178,19 @@ func (c *LongConnClient) Start(ctx context.Context) error {
 			return ctx.Err()
 		}
 
+		connectedAt := time.Now()
 		err := c.connectAndRun(ctx)
 		if c.closed.Load() {
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// If the connection was up for longer than the max backoff window,
+		// the disconnect is likely transient — reset so we retry quickly.
+		if time.Since(connectedAt) > defaultReconnectMaxDelay {
+			attempts = 0
 		}
 
 		attempts++
@@ -154,8 +223,11 @@ func (c *LongConnClient) Stop() {
 // SendReply sends a text reply through the WebSocket connection.
 // This is used by the IM service to reply to messages in long connection mode.
 func (c *LongConnClient) SendReply(ctx context.Context, incoming *im.IncomingMessage, reply *im.ReplyMessage) error {
-	reqID, ok := incoming.Extra["req_id"]
-	if !ok || reqID == "" {
+	var reqID string
+	if incoming.Extra != nil {
+		reqID = incoming.Extra["req_id"]
+	}
+	if reqID == "" {
 		return fmt.Errorf("missing req_id in incoming message extra")
 	}
 
@@ -188,7 +260,7 @@ func (c *LongConnClient) SendReply(ctx context.Context, incoming *im.IncomingMes
 // StartStream begins a streaming reply session.
 // Returns a stream ID that must be used in subsequent chunk/end calls.
 func (c *LongConnClient) StartStream(ctx context.Context, incoming *im.IncomingMessage) (string, error) {
-	if _, ok := incoming.Extra["req_id"]; !ok {
+	if incoming.Extra == nil || incoming.Extra["req_id"] == "" {
 		return "", fmt.Errorf("missing req_id in incoming message extra")
 	}
 	streamID := fmt.Sprintf("stream_%d", c.reqSeq.Add(1))
@@ -226,6 +298,7 @@ func (c *LongConnClient) SendStreamChunk(ctx context.Context, incoming *im.Incom
 }
 
 // EndStream sends the final frame with the full accumulated content and cleans up.
+// It retries briefly if the connection is temporarily unavailable during a reconnect.
 func (c *LongConnClient) EndStream(ctx context.Context, incoming *im.IncomingMessage, streamID string) error {
 	c.streamBufsMu.Lock()
 	buf, ok := c.streamBufs[streamID]
@@ -236,11 +309,33 @@ func (c *LongConnClient) EndStream(ctx context.Context, incoming *im.IncomingMes
 	}
 	c.streamBufsMu.Unlock()
 
-	return c.sendStreamFrame(incoming, streamID, fullContent, true)
+	err := c.sendStreamFrame(incoming, streamID, fullContent, true)
+	if err == nil {
+		return nil
+	}
+
+	// Retry up to 3 times with short delays to ride out a reconnection window.
+	for i := 0; i < 3; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+		if retryErr := c.sendStreamFrame(incoming, streamID, fullContent, true); retryErr == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func (c *LongConnClient) sendStreamFrame(incoming *im.IncomingMessage, streamID, content string, finish bool) error {
-	reqID := incoming.Extra["req_id"]
+	var reqID string
+	if incoming.Extra != nil {
+		reqID = incoming.Extra["req_id"]
+	}
+	if reqID == "" {
+		return fmt.Errorf("missing req_id in incoming message extra")
+	}
 
 	body := streamReplyBody{MsgType: "stream"}
 	body.Stream.ID = streamID
@@ -262,7 +357,7 @@ func (c *LongConnClient) sendStreamFrame(incoming *im.IncomingMessage, streamID,
 }
 
 func (c *LongConnClient) connectAndRun(ctx context.Context) error {
-	conn, _, err := ws.DefaultDialer.DialContext(ctx, wecomWSEndpoint, nil)
+	conn, _, err := ws.DefaultDialer.DialContext(ctx, c.endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -276,6 +371,11 @@ func (c *LongConnClient) connectAndRun(ctx context.Context) error {
 		c.conn = nil
 		c.mu.Unlock()
 		_ = conn.Close()
+		// NOTE: streamBufs is intentionally NOT cleared on reconnect.
+		// Active streams survive reconnections — the WeCom replace-based
+		// protocol means the next SendStreamChunk will resend the full
+		// accumulated content on the new connection. EndStream always
+		// cleans up the buffer, so there is no memory leak.
 	}()
 
 	// Authenticate
@@ -290,8 +390,12 @@ func (c *LongConnClient) connectAndRun(ctx context.Context) error {
 	defer heartbeatCancel()
 	go c.heartbeatLoop(heartbeatCtx)
 
-	// Message receive loop
+	// Message receive loop with read deadline.
+	// The deadline is reset on every successful read; if no message arrives
+	// within readTimeout (including heartbeat pong frames), the connection
+	// is considered dead and we fall through to reconnect.
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("read message: %w", err)
@@ -372,7 +476,8 @@ func (c *LongConnClient) heartbeatLoop(ctx context.Context) {
 				Headers: map[string]string{"req_id": reqID},
 			}
 			if err := c.writeJSON(frame); err != nil {
-				logger.Warnf(ctx, "[WeCom] Heartbeat failed: %v", err)
+				logger.Warnf(ctx, "[WeCom] Heartbeat failed: %v, closing connection to trigger reconnect", err)
+				c.closeConn()
 				return
 			}
 		}
@@ -380,21 +485,35 @@ func (c *LongConnClient) heartbeatLoop(ctx context.Context) {
 }
 
 func (c *LongConnClient) handleCallback(ctx context.Context, frame wsFrame) {
+	// Log raw message body for debugging
+	logger.Debugf(ctx, "[WeCom] Raw callback body: %s", string(frame.Body))
+
 	var msg botMessage
 	if err := json.Unmarshal(frame.Body, &msg); err != nil {
 		logger.Warnf(ctx, "[WeCom] Failed to unmarshal callback body: %v", err)
 		return
 	}
 
-	// Only handle text messages for now
-	if msg.MsgType != "text" {
-		logger.Infof(ctx, "[WeCom] Ignoring non-text message type: %s", msg.MsgType)
+	logger.Debugf(ctx, "[WeCom] Parsed message: msgid=%s msgtype=%s from=%s chattype=%s text=%q image_url=%q file_url=%q voice=%q mixed_items=%d",
+		msg.MsgID, msg.MsgType, msg.From.UserID, msg.ChatType,
+		msg.Text.Content, msg.Image.URL, msg.File.URL, msg.Voice.Content, len(msg.Mixed.MsgItem))
+
+	// Handle server-side events (e.g. disconnected_event) before normal messages.
+	if msg.MsgType == "event" {
+		switch msg.Event.EventType {
+		case "disconnected_event":
+			logger.Warnf(ctx, "[WeCom] Server sent disconnected_event, closing connection to trigger reconnect")
+			c.closeConn()
+		default:
+			logger.Infof(ctx, "[WeCom] Ignoring event type: %s", msg.Event.EventType)
+		}
 		return
 	}
 
 	chatType := im.ChatTypeDirect
 	chatID := ""
-	if msg.ChatType == "group" {
+	isGroup := msg.ChatType == "group"
+	if isGroup {
 		chatType = im.ChatTypeGroup
 		chatID = msg.ChatID
 	}
@@ -405,20 +524,242 @@ func (c *LongConnClient) handleCallback(ctx context.Context, frame wsFrame) {
 		reqID = frame.Headers["req_id"]
 	}
 
-	incoming := &im.IncomingMessage{
-		Platform:  im.PlatformWeCom,
-		UserID:    msg.From.UserID,
-		UserName:  msg.From.UserID,
-		ChatID:    chatID,
-		ChatType:  chatType,
-		Content:   strings.TrimSpace(msg.Text.Content),
-		MessageID: msg.MsgID,
-		Extra:     map[string]string{"req_id": reqID},
+	var incoming *im.IncomingMessage
+
+	switch msg.MsgType {
+	case "text":
+		// WeCom does not strip @mention in group chat; strip it so slash
+		// commands (/stop, /clear) are recognized.
+		textContent := msg.Text.Content
+		if isGroup {
+			textContent = c.stripAtMention(textContent)
+		}
+		incoming = &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeText,
+			UserID:      msg.From.UserID,
+			UserName:    msg.From.UserID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			Content:     strings.TrimSpace(textContent),
+			MessageID:   msg.MsgID,
+			Extra:       map[string]string{"req_id": reqID},
+		}
+
+	case "voice":
+		// WeCom returns speech-to-text content directly — treat as text query
+		if msg.Voice.Content == "" {
+			logger.Infof(ctx, "[WeCom] Ignoring voice message with empty content")
+			return
+		}
+		incoming = &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeText,
+			UserID:      msg.From.UserID,
+			UserName:    msg.From.UserID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			Content:     strings.TrimSpace(msg.Voice.Content),
+			MessageID:   msg.MsgID,
+			Extra:       map[string]string{"req_id": reqID},
+		}
+
+	case "image":
+		if msg.Image.URL == "" {
+			logger.Infof(ctx, "[WeCom] Ignoring image message with empty URL")
+			return
+		}
+		incoming = &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeImage,
+			UserID:      msg.From.UserID,
+			UserName:    msg.From.UserID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			MessageID:   msg.MsgID,
+			FileKey:     msg.Image.URL, // store encrypted URL in FileKey
+			FileName:    msg.MsgID + ".png",
+			Extra:       map[string]string{"req_id": reqID, "aes_key": msg.Image.AESKey},
+		}
+
+	case "file":
+		if msg.File.URL == "" {
+			logger.Infof(ctx, "[WeCom] Ignoring file message with empty URL")
+			return
+		}
+		incoming = &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeFile,
+			UserID:      msg.From.UserID,
+			UserName:    msg.From.UserID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			MessageID:   msg.MsgID,
+			FileKey:     msg.File.URL, // store encrypted URL in FileKey
+			FileName:    msg.MsgID,    // WeCom doesn't provide file name directly
+			Extra:       map[string]string{"req_id": reqID, "aes_key": msg.File.AESKey},
+		}
+
+	case "mixed":
+		// Extract text parts for QA content, and detect if any images are present
+		incoming = c.convertMixedMessage(&msg, chatID, chatType, reqID)
+		if incoming == nil {
+			logger.Infof(ctx, "[WeCom] Ignoring empty mixed message")
+			return
+		}
+
+	default:
+		logger.Infof(ctx, "[WeCom] Ignoring unsupported message type: %s", msg.MsgType)
+		return
+	}
+
+	// Populate quote context if the incoming message has a quoted/replied message.
+	if incoming != nil && msg.Quote != nil {
+		incoming.Quote = buildQuotedMessage(msg.Quote, msg.AiBotID)
+		if incoming.Quote != nil {
+			logger.Infof(ctx, "[WeCom] Quote detected: msgid=%s sender=%s is_bot=%v content_len=%d non_text_type=%s",
+				msg.Quote.MsgID, msg.Quote.From.UserID, incoming.Quote.IsBotMessage, len(incoming.Quote.Content), incoming.Quote.NonTextType)
+			// Debug: log raw IDs for bot identity verification during initial rollout
+			logger.Debugf(ctx, "[WeCom] Quote identity debug: quote.from.userid=%q quote.aibotid=%q msg.aibotid=%q",
+				msg.Quote.From.UserID, msg.Quote.AiBotID, msg.AiBotID)
+		}
 	}
 
 	if err := c.handler(ctx, incoming); err != nil {
 		logger.Errorf(ctx, "[WeCom] Handle message error: %v", err)
 	}
+}
+
+// convertMixedMessage converts a WeCom mixed (text+image) message.
+// Extracts all text content for QA; if there's only images, treat as image message.
+func (c *LongConnClient) convertMixedMessage(msg *botMessage, chatID string, chatType im.ChatType, reqID string) *im.IncomingMessage {
+	isGroup := chatType == im.ChatTypeGroup
+	var textParts []string
+	var firstImageURL string
+	var firstImageAESKey string
+
+	for _, item := range msg.Mixed.MsgItem {
+		switch item.MsgType {
+		case "text":
+			t := strings.TrimSpace(item.Text.Content)
+			if isGroup {
+				t = c.stripAtMention(t)
+			}
+			if t != "" {
+				textParts = append(textParts, t)
+			}
+		case "image":
+			if firstImageURL == "" && item.Image.URL != "" {
+				firstImageURL = item.Image.URL
+				firstImageAESKey = item.Image.AESKey
+			}
+		}
+	}
+
+	// If there's text content, treat as text message (QA query)
+	if len(textParts) > 0 {
+		return &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeText,
+			UserID:      msg.From.UserID,
+			UserName:    msg.From.UserID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			Content:     strings.Join(textParts, "\n"),
+			MessageID:   msg.MsgID,
+			Extra:       map[string]string{"req_id": reqID},
+		}
+	}
+
+	// Only images, treat as image message (save to KB)
+	if firstImageURL != "" {
+		return &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeImage,
+			UserID:      msg.From.UserID,
+			UserName:    msg.From.UserID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			MessageID:   msg.MsgID,
+			FileKey:     firstImageURL,
+			FileName:    msg.MsgID + ".png",
+			Extra:       map[string]string{"req_id": reqID, "aes_key": firstImageAESKey},
+		}
+	}
+
+	return nil
+}
+
+// closeConn forcibly closes the underlying WebSocket, which unblocks any
+// pending ReadMessage call in the receive loop and triggers a reconnection.
+func (c *LongConnClient) closeConn() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+}
+
+// stripAtMentionBasic removes a leading "@Name" prefix from group chat content.
+// Strategies: double-space split → heuristic (space + "/" or CJK) → first @word.
+// Used directly by the webhook adapter (stateless) and as the base for
+// LongConnClient.stripAtMention (stateful).
+func stripAtMentionBasic(content string) string {
+	content = strings.TrimSpace(content)
+	if !strings.HasPrefix(content, "@") {
+		return content
+	}
+	// Some WeCom clients insert two spaces between @mention and user text.
+	if idx := strings.Index(content, "  "); idx > 0 {
+		return strings.TrimSpace(content[idx+2:])
+	}
+	// Heuristic: bot names are ASCII words; user content starts with "/"
+	// or non-ASCII (CJK). Scan for the transition.
+	for i := 1; i < len(content); i++ {
+		if content[i] == ' ' && i+1 < len(content) {
+			if next := content[i+1]; next == '/' || next >= 0x80 {
+				return strings.TrimSpace(content[i+1:])
+			}
+		}
+	}
+	// Fallback: strip first @word.
+	if idx := strings.Index(content, " "); idx > 0 {
+		return strings.TrimSpace(content[idx+1:])
+	}
+	return content
+}
+
+// stripAtMention removes the leading "@BotName" prefix from group chat messages.
+// Bot names may contain spaces (e.g., "WeKnora Bot"), so this adds two strategies
+// on top of stripAtMentionBasic: (1) double-space split with bot-name learning,
+// (2) cached/configured bot name prefix match.
+// Concurrent calls are safe; atomic.Value races are benign (same bot name).
+func (c *LongConnClient) stripAtMention(content string) string {
+	content = strings.TrimSpace(content)
+	if !strings.HasPrefix(content, "@") {
+		return content
+	}
+
+	// Strategy 1: double-space separator. Learn bot name on first occurrence
+	// (skip if already cached to avoid false positives from user double-spaces).
+	if idx := strings.Index(content, "  "); idx > 0 {
+		botName := content[1:idx] // between "@" and "  "
+		if cached, _ := c.botDisplayName.Load().(string); cached == "" && botName != "" {
+			c.botDisplayName.Store(botName)
+		}
+		return strings.TrimSpace(content[idx+2:])
+	}
+
+	// Strategy 2: cached/configured bot name with word-boundary check.
+	if name, _ := c.botDisplayName.Load().(string); name != "" {
+		prefix := "@" + name
+		if strings.HasPrefix(content, prefix) && (len(content) == len(prefix) || content[len(prefix)] == ' ') {
+			return strings.TrimSpace(content[len(prefix):])
+		}
+	}
+
+	// Strategy 3: delegate to stateless helper (heuristic scan + first-@word fallback).
+	return stripAtMentionBasic(content)
 }
 
 func (c *LongConnClient) writeJSON(v interface{}) error {

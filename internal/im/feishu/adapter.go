@@ -29,8 +29,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// Compile-time check that Adapter implements im.StreamSender.
+// Compile-time check that Adapter implements im.StreamSender and im.FileDownloader.
 var _ im.StreamSender = (*Adapter)(nil)
+var _ im.FileDownloader = (*Adapter)(nil)
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
@@ -49,11 +50,50 @@ type Adapter struct {
 
 // NewAdapter creates a new Feishu adapter.
 func NewAdapter(appID, appSecret, verificationToken, encryptKey string) *Adapter {
+	startStreamReaper()
 	return &Adapter{
 		appID:             appID,
 		appSecret:         appSecret,
 		verificationToken: verificationToken,
 		encryptKey:        encryptKey,
+	}
+}
+
+// startStreamReaper starts a background goroutine (once) that periodically
+// removes orphaned stream entries from feishuStreams. This prevents memory
+// leaks when EndStream is never called due to panics or pipeline errors.
+func startStreamReaper() {
+	startReaperOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(streamReaperInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					cutoff := time.Now().Add(-streamOrphanTTL)
+					feishuStreamsMu.Lock()
+					for id, state := range feishuStreams {
+						if state.createdAt.Before(cutoff) {
+							delete(feishuStreams, id)
+						}
+					}
+					feishuStreamsMu.Unlock()
+				case <-reaperStopCh:
+					return
+				}
+			}
+		}()
+	})
+}
+
+// StopStreamReaper stops the background stream reaper goroutine.
+// Should be called during application shutdown.
+func StopStreamReaper() {
+	select {
+	case <-reaperStopCh:
+		// already closed
+	default:
+		close(reaperStopCh)
 	}
 }
 
@@ -165,6 +205,8 @@ type feishuEvent struct {
 
 type feishuMessage struct {
 	MessageID   string `json:"message_id"`
+	RootID      string `json:"root_id"`
+	ParentID    string `json:"parent_id"`
 	MessageType string `json:"message_type"`
 	ChatType    string `json:"chat_type"`
 	ChatID      string `json:"chat_id"`
@@ -223,17 +265,10 @@ func (a *Adapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
 	}
 	msg := eventBody.Event.Message
 
-	if msg.MessageType != "text" {
-		logger.Infof(c.Request.Context(), "[Feishu] Ignoring non-text message type: %s", msg.MessageType)
-		return nil, nil
-	}
-
-	// Parse text content
-	var textContent struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal([]byte(msg.Content), &textContent); err != nil {
-		return nil, fmt.Errorf("unmarshal text content: %w", err)
+	// Compute thread ID: use root_id for threaded replies, or message_id for top-level messages.
+	threadID := msg.RootID
+	if threadID == "" {
+		threadID = msg.MessageID
 	}
 
 	// Determine chat type
@@ -250,28 +285,150 @@ func (a *Adapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
 		openID = eventBody.Event.Sender.SenderID.OpenID
 	}
 
-	// Strip @bot mention from group messages
-	content := textContent.Text
-	if chatType == im.ChatTypeGroup {
-		// Feishu @mentions are in the format @_user_xxx
-		for strings.HasPrefix(content, "@_user_") {
-			idx := strings.Index(content, " ")
-			if idx >= 0 {
-				content = content[idx+1:]
-			} else {
-				break
+	switch msg.MessageType {
+	case "text":
+		// Parse text content
+		var textContent struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(msg.Content), &textContent); err != nil {
+			return nil, fmt.Errorf("unmarshal text content: %w", err)
+		}
+
+		// Strip @bot mention from group messages
+		content := textContent.Text
+		if chatType == im.ChatTypeGroup {
+			for strings.HasPrefix(content, "@_user_") {
+				idx := strings.Index(content, " ")
+				if idx >= 0 {
+					content = content[idx+1:]
+				} else {
+					break
+				}
 			}
 		}
-	}
 
-	return &im.IncomingMessage{
-		Platform:  im.PlatformFeishu,
-		UserID:    openID,
-		ChatID:    chatID,
-		ChatType:  chatType,
-		Content:   strings.TrimSpace(content),
-		MessageID: msg.MessageID,
-	}, nil
+		return &im.IncomingMessage{
+			Platform:    im.PlatformFeishu,
+			MessageType: im.MessageTypeText,
+			UserID:      openID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			Content:     strings.TrimSpace(content),
+			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
+		}, nil
+
+	case "file":
+		var fileContent struct {
+			FileKey  string `json:"file_key"`
+			FileName string `json:"file_name"`
+		}
+		if err := json.Unmarshal([]byte(msg.Content), &fileContent); err != nil {
+			return nil, fmt.Errorf("unmarshal file content: %w", err)
+		}
+		if fileContent.FileKey == "" {
+			return nil, nil
+		}
+		return &im.IncomingMessage{
+			Platform:    im.PlatformFeishu,
+			MessageType: im.MessageTypeFile,
+			UserID:      openID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
+			FileKey:     fileContent.FileKey,
+			FileName:    fileContent.FileName,
+		}, nil
+
+	case "image":
+		var imageContent struct {
+			ImageKey string `json:"image_key"`
+		}
+		if err := json.Unmarshal([]byte(msg.Content), &imageContent); err != nil {
+			return nil, fmt.Errorf("unmarshal image content: %w", err)
+		}
+		if imageContent.ImageKey == "" {
+			return nil, nil
+		}
+		return &im.IncomingMessage{
+			Platform:    im.PlatformFeishu,
+			MessageType: im.MessageTypeImage,
+			UserID:      openID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
+			FileKey:     imageContent.ImageKey,
+			FileName:    imageContent.ImageKey + ".png",
+		}, nil
+
+	case "post":
+		// Rich text: extract plain text for QA
+		var postContent struct {
+			Title   string              `json:"title"`
+			Content [][]json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(msg.Content), &postContent); err != nil {
+			return nil, fmt.Errorf("unmarshal post content: %w", err)
+		}
+
+		var textParts []string
+		if postContent.Title != "" {
+			textParts = append(textParts, postContent.Title)
+		}
+		for _, line := range postContent.Content {
+			var lineText strings.Builder
+			for _, elem := range line {
+				var tag struct {
+					Tag  string `json:"tag"`
+					Text string `json:"text"`
+				}
+				if err := json.Unmarshal(elem, &tag); err != nil {
+					continue
+				}
+				switch tag.Tag {
+				case "text", "a":
+					lineText.WriteString(tag.Text)
+				}
+			}
+			if t := strings.TrimSpace(lineText.String()); t != "" {
+				textParts = append(textParts, t)
+			}
+		}
+
+		content := strings.Join(textParts, "\n")
+		if chatType == im.ChatTypeGroup {
+			for strings.HasPrefix(content, "@_user_") {
+				idx := strings.Index(content, " ")
+				if idx >= 0 {
+					content = content[idx+1:]
+				} else {
+					break
+				}
+			}
+		}
+		content = strings.TrimSpace(content)
+		if content == "" {
+			return nil, nil
+		}
+
+		return &im.IncomingMessage{
+			Platform:    im.PlatformFeishu,
+			MessageType: im.MessageTypeText,
+			UserID:      openID,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			Content:     content,
+			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
+		}, nil
+
+	default:
+		logger.Infof(c.Request.Context(), "[Feishu] Ignoring unsupported message type: %s", msg.MessageType)
+		return nil, nil
+	}
 }
 
 // SendReply sends a reply message via Feishu API.
@@ -328,6 +485,80 @@ func (a *Adapter) SendReply(ctx context.Context, incoming *im.IncomingMessage, r
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// File download support via Feishu GetMessageResource API
+// ──────────────────────────────────────────────────────────────────────
+
+// feishuSafePathParam checks that a Feishu API path parameter contains only
+// safe characters (alphanumeric, hyphen, underscore). This prevents path
+// traversal attacks via crafted callback payloads.
+func feishuSafePathParam(s string) bool {
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// DownloadFile downloads a file or image attachment from a Feishu message.
+// Uses the GetMessageResource API: GET /open-apis/im/v1/messages/:message_id/resources/:file_key?type={file|image}
+func (a *Adapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io.ReadCloser, string, error) {
+	if msg.FileKey == "" || msg.MessageID == "" {
+		return nil, "", fmt.Errorf("file_key and message_id are required")
+	}
+
+	// SSRF/path-traversal protection: validate path parameters contain only safe characters
+	if !feishuSafePathParam(msg.MessageID) || !feishuSafePathParam(msg.FileKey) {
+		return nil, "", fmt.Errorf("invalid message_id or file_key format")
+	}
+
+	accessToken, err := a.getTenantAccessToken(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("get access token: %w", err)
+	}
+
+	// Determine resource type based on message type
+	resourceType := "file"
+	if msg.MessageType == im.MessageTypeImage {
+		resourceType = "image"
+	}
+
+	apiURL := fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s/resources/%s?type=%s",
+		msg.MessageID, msg.FileKey, resourceType)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("download file: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("download file failed: status=%d", resp.StatusCode)
+	}
+
+	// Use the original file name from the message, or extract from Content-Disposition
+	fileName := msg.FileName
+	if fileName == "" {
+		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+			if idx := strings.Index(cd, "filename="); idx >= 0 {
+				fileName = strings.Trim(cd[idx+len("filename="):], "\" ")
+			}
+		}
+	}
+	if fileName == "" {
+		fileName = msg.FileKey
+	}
+
+	return resp.Body, fileName, nil
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Feishu CardKit v1 streaming implementation (official best practice)
 //
 // Flow:
@@ -347,14 +578,27 @@ const (
 
 // feishuStreamState tracks per-stream accumulated content.
 type feishuStreamState struct {
-	mu      sync.Mutex
-	content strings.Builder
-	seq     int64 // strictly incrementing sequence for CardKit API
+	mu         sync.Mutex
+	content    strings.Builder
+	seq        int64     // strictly incrementing sequence for CardKit API
+	createdAt  time.Time // for orphan stream detection
+	firstChunk bool      // true after the first real content chunk clears the placeholder
 }
+
+const (
+	// streamOrphanTTL is the maximum lifetime of a stream entry before it's
+	// considered orphaned (e.g., EndStream was never called due to an error).
+	streamOrphanTTL = 5 * time.Minute
+	// streamReaperInterval is how often the reaper scans for orphaned streams.
+	streamReaperInterval = 1 * time.Minute
+)
 
 var (
 	feishuStreamsMu sync.Mutex
-	feishuStreams    = map[string]*feishuStreamState{}
+	feishuStreams   = map[string]*feishuStreamState{}
+
+	startReaperOnce sync.Once
+	reaperStopCh    = make(chan struct{})
 )
 
 func (s *feishuStreamState) nextSeq() int {
@@ -378,7 +622,7 @@ func buildStreamingCardJSON() string {
 			"elements": []map[string]interface{}{
 				{
 					"tag":        "markdown",
-					"content":    "",
+					"content":    "💭 正在思考...",
 					"text_size":  "normal",
 					"element_id": streamingElementID,
 				},
@@ -410,7 +654,7 @@ func (a *Adapter) StartStream(ctx context.Context, incoming *im.IncomingMessage)
 
 	// 3. Track stream state
 	feishuStreamsMu.Lock()
-	feishuStreams[cardID] = &feishuStreamState{}
+	feishuStreams[cardID] = &feishuStreamState{createdAt: time.Now()}
 	feishuStreamsMu.Unlock()
 
 	logger.Infof(ctx, "[Feishu] Streaming started: card_id=%s", cardID)
@@ -418,6 +662,8 @@ func (a *Adapter) StartStream(ctx context.Context, incoming *im.IncomingMessage)
 }
 
 // SendStreamChunk accumulates content and pushes it to the card element.
+// Content containing <think>...</think> blocks is transformed into
+// Feishu-compatible markdown blockquotes before sending.
 func (a *Adapter) SendStreamChunk(ctx context.Context, incoming *im.IncomingMessage, streamID string, content string) error {
 	if content == "" {
 		return nil
@@ -431,8 +677,13 @@ func (a *Adapter) SendStreamChunk(ctx context.Context, incoming *im.IncomingMess
 	}
 
 	state.mu.Lock()
+	if !state.firstChunk {
+		// Clear the "💭 正在思考..." placeholder on first real content
+		state.content.Reset()
+		state.firstChunk = true
+	}
 	state.content.WriteString(content)
-	fullContent := state.content.String()
+	fullContent := transformThinkBlocks(state.content.String())
 	seq := state.nextSeq()
 	state.mu.Unlock()
 
@@ -442,6 +693,10 @@ func (a *Adapter) SendStreamChunk(ctx context.Context, incoming *im.IncomingMess
 	}
 
 	return a.cardkitUpdateElement(ctx, accessToken, streamID, streamingElementID, fullContent, seq)
+}
+
+func transformThinkBlocks(content string) string {
+	return im.TransformThinkBlocks(content, im.MarkdownThinkStyle)
 }
 
 // EndStream disables streaming_mode and cleans up state.

@@ -25,6 +25,7 @@
                 >
                   <t-icon :name="item.icon" class="nav-icon" />
                   <span class="nav-label">{{ item.label }}</span>
+                  <span v-if="item.badge" class="nav-badge">{{ item.badge }}</span>
                 </div>
               </div>
             </div>
@@ -51,6 +52,69 @@
                         </t-radio-group>
                         <p class="form-tip">{{ $t('knowledgeEditor.basic.typeDescription') }}</p>
                       </div>
+
+                      <!-- 索引策略 (紧跟类型选择) -->
+                      <div v-if="!isFAQ" class="form-item">
+                        <label class="form-label required">{{ $t('knowledgeEditor.indexing.title') }}</label>
+                        <p class="form-tip">{{ $t('knowledgeEditor.indexing.description') }}</p>
+                        <div class="indexing-checks" :class="{ 'is-locked': isIndexingLocked }">
+                          <div
+                            class="indexing-check-item"
+                            :class="{ 'is-checked': formData.indexingStrategy.vectorEnabled, 'is-disabled': isIndexingLocked }"
+                            @click="toggleVectorIndexing"
+                          >
+                            <t-checkbox
+                              :checked="formData.indexingStrategy.vectorEnabled"
+                              :disabled="isIndexingLocked"
+                              class="indexing-check-box"
+                            >{{ $t('knowledgeEditor.indexing.searchTitle') }}</t-checkbox>
+                            <p class="indexing-check-desc">{{ $t('knowledgeEditor.indexing.searchDesc') }}</p>
+                          </div>
+                          <div
+                            class="indexing-check-item"
+                            :class="{ 'is-checked': formData.indexingStrategy.wikiEnabled, 'is-disabled': isIndexingLocked }"
+                            @click="toggleWikiIndexing"
+                          >
+                            <t-checkbox
+                              :checked="formData.indexingStrategy.wikiEnabled"
+                              :disabled="isIndexingLocked"
+                              class="indexing-check-box"
+                            >
+                              <span class="indexing-check-title">
+                                {{ $t('knowledgeEditor.indexing.wikiTitle') }}
+                                <span class="indexing-new-badge">NEW</span>
+                              </span>
+                            </t-checkbox>
+                            <p class="indexing-check-desc">{{ $t('knowledgeEditor.indexing.wikiDesc') }}</p>
+                          </div>
+                        </div>
+                        <p v-if="isIndexingLocked" class="form-tip locked-tip">
+                          {{ $t('knowledgeEditor.indexing.lockedTip') }}
+                        </p>
+                      </div>
+
+                      <!-- Wiki 提取粒度 (仅当 Wiki 启用时显示) -->
+                      <div v-if="!isFAQ && formData.indexingStrategy.wikiEnabled" class="form-item">
+                        <label class="form-label">{{ $t('knowledgeEditor.wiki.extractionGranularityLabel') }}</label>
+                        <p class="form-tip">{{ $t('knowledgeEditor.wiki.extractionGranularityTip') }}</p>
+                        <t-radio-group
+                          :value="resolvedGranularity"
+                          class="granularity-radio-group"
+                          @change="handleGranularityChange"
+                        >
+                          <t-radio-button value="focused">
+                            {{ $t('knowledgeEditor.wiki.granularityFocused') }}
+                          </t-radio-button>
+                          <t-radio-button value="standard">
+                            {{ $t('knowledgeEditor.wiki.granularityStandard') }}
+                          </t-radio-button>
+                          <t-radio-button value="exhaustive">
+                            {{ $t('knowledgeEditor.wiki.granularityExhaustive') }}
+                          </t-radio-button>
+                        </t-radio-group>
+                        <p class="form-tip granularity-hint">{{ granularityHint }}</p>
+                      </div>
+
                       <div class="form-item">
                         <label class="form-label required">{{ $t('knowledgeEditor.basic.nameLabel') }}</label>
                         <t-input 
@@ -61,13 +125,15 @@
                       </div>
                       <div class="form-item">
                         <label class="form-label">{{ $t('knowledgeEditor.basic.descriptionLabel') }}</label>
-                        <t-textarea 
-                          v-model="formData.description" 
+                        <t-textarea
+                          v-model="formData.description"
                           :placeholder="$t('knowledgeEditor.basic.descriptionPlaceholder')"
                           :maxlength="200"
                           :autosize="{ minRows: 3, maxRows: 6 }"
                         />
                       </div>
+
+                      <!-- Wiki 合成模型移至模型配置页 -->
                     </div>
                   </div>
                 </div>
@@ -79,6 +145,8 @@
                     v-if="formData"
                     :config="formData.modelConfig"
                     :has-files="hasFiles"
+                    :wiki-enabled="formData.indexingStrategy?.wikiEnabled"
+                    :rag-enabled="formData.indexingStrategy?.vectorEnabled || formData.indexingStrategy?.keywordEnabled"
                     :all-models="allModels"
                     @update:config="handleModelConfigUpdate"
                   />
@@ -145,11 +213,101 @@
                   />
                 </div>
 
-                <!-- 图谱设置 -->
+                <!-- 多模态配置 -->
+                <div v-if="!isFAQ" v-show="currentSection === 'multimodal'" class="section">
+                  <div v-if="formData" class="kb-multimodal-settings">
+                    <div class="section-header">
+                      <h2>{{ $t('knowledgeEditor.multimodal.title') }}</h2>
+                      <p class="section-description">{{ $t('knowledgeEditor.multimodal.description') }}</p>
+                    </div>
+
+                    <div class="settings-group">
+                      <!-- 多模态开关 -->
+                      <div class="setting-row">
+                        <div class="setting-info">
+                          <label>{{ $t('knowledgeEditor.advanced.multimodal.label') }}</label>
+                          <p class="desc">{{ $t('knowledgeEditor.advanced.multimodal.description') }}</p>
+                        </div>
+                        <div class="setting-control">
+                          <t-switch
+                            v-model="formData.multimodalConfig.enabled"
+                            @change="handleMultimodalToggle"
+                            size="medium"
+                          />
+                        </div>
+                      </div>
+
+                      <!-- VLLM 模型选择（多模态启用时） -->
+                      <div v-if="formData.multimodalConfig.enabled" class="setting-row">
+                        <div class="setting-info">
+                          <label>{{ $t('knowledgeEditor.advanced.multimodal.vllmLabel') }} <span class="required">*</span></label>
+                          <p class="desc">{{ $t('knowledgeEditor.advanced.multimodal.vllmDescription') }}</p>
+                        </div>
+                        <div class="setting-control">
+                          <ModelSelector
+                            model-type="VLLM"
+                            :selected-model-id="formData.multimodalConfig.vllmModelId"
+                            :all-models="allModels"
+                            @update:selected-model-id="handleMultimodalVLLMChange"
+                            @add-model="handleAddVLLMModel"
+                            :placeholder="$t('knowledgeEditor.advanced.multimodal.vllmPlaceholder')"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 音频处理（ASR）设置 -->
+                <div v-if="!isFAQ" v-show="currentSection === 'asr'" class="section">
+                  <div v-if="formData" class="kb-multimodal-settings">
+                    <div class="section-header">
+                      <h2>{{ $t('knowledgeEditor.asr.title') }}</h2>
+                      <p class="section-description">{{ $t('knowledgeEditor.asr.description') }}</p>
+                    </div>
+
+                    <div class="settings-group">
+                      <!-- ASR 开关 -->
+                      <div class="setting-row">
+                        <div class="setting-info">
+                          <label>{{ $t('knowledgeEditor.asr.label') }}</label>
+                          <p class="desc">{{ $t('knowledgeEditor.asr.desc') }}</p>
+                        </div>
+                        <div class="setting-control">
+                          <t-switch
+                            v-model="formData.asrConfig.enabled"
+                            size="medium"
+                          />
+                        </div>
+                      </div>
+
+                      <!-- ASR 模型选择 -->
+                      <div v-if="formData.asrConfig.enabled" class="setting-row">
+                        <div class="setting-info">
+                          <label>{{ $t('knowledgeEditor.asr.modelLabel') }} <span class="required">*</span></label>
+                          <p class="desc">{{ $t('knowledgeEditor.asr.modelDescription') }}</p>
+                        </div>
+                        <div class="setting-control">
+                          <ModelSelector
+                            model-type="ASR"
+                            :selected-model-id="formData.asrConfig.modelId"
+                            :all-models="allModels"
+                            @update:selected-model-id="(val: string) => { if (formData) formData.asrConfig.modelId = val }"
+                            @add-model="handleAddASRModel"
+                            :placeholder="$t('knowledgeEditor.asr.modelPlaceholder')"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 知识图谱 -->
                 <div v-if="!isFAQ" v-show="currentSection === 'graph'" class="section">
                   <GraphSettings
                     v-if="formData"
                     :graph-extract="formData.nodeExtractConfig"
+                    :model-id="formData.modelConfig.llmModelId"
                     :all-models="allModels"
                     @update:graphExtract="handleNodeExtractUpdate"
                   />
@@ -160,12 +318,16 @@
                   <KBAdvancedSettings
                     ref="advancedSettingsRef"
                     v-if="formData"
-                    :multimodal="formData.multimodalConfig"
                     :question-generation="formData.questionGenerationConfig"
+                    :rag-enabled="formData.indexingStrategy?.vectorEnabled || formData.indexingStrategy?.keywordEnabled"
                     :all-models="allModels"
-                    @update:multimodal="handleMultimodalUpdate"
                     @update:question-generation="handleQuestionGenerationUpdate"
                   />
+                </div>
+
+                <!-- 数据源管理（仅编辑模式） -->
+                <div v-if="mode === 'edit' && kbId" v-show="currentSection === 'datasource'" class="section">
+                  <DataSourceSettings :kb-id="kbId" @count="dsCount = $event" />
                 </div>
 
                 <!-- 共享设置（仅编辑模式） -->
@@ -193,21 +355,25 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { MessagePlugin } from 'tdesign-vue-next'
-import { createKnowledgeBase, getKnowledgeBaseById, listKnowledgeFiles, updateKnowledgeBase } from '@/api/knowledge-base'
+import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
+import { createKnowledgeBase, getKnowledgeBaseById, listKnowledgeFiles, updateKnowledgeBase, rebuildKBIndex } from '@/api/knowledge-base'
 import { updateKBConfig, type KBModelConfigRequest } from '@/api/initialization'
 import { listModels } from '@/api/model'
 import { useUIStore } from '@/stores/ui'
+import { useAuthStore } from '@/stores/auth'
 import KBModelConfig from './settings/KBModelConfig.vue'
 import KBParserSettings from './settings/KBParserSettings.vue'
 import KBStorageSettings from './settings/KBStorageSettings.vue'
 import KBChunkingSettings from './settings/KBChunkingSettings.vue'
 import KBAdvancedSettings from './settings/KBAdvancedSettings.vue'
+import ModelSelector from '@/components/ModelSelector.vue'
 import GraphSettings from './settings/GraphSettings.vue'
 import KBShareSettings from './settings/KBShareSettings.vue'
+import DataSourceSettings from './settings/DataSourceSettings.vue'
 import { useI18n } from 'vue-i18n'
 
 const uiStore = useUIStore()
+const authStore = useAuthStore()
 const { t } = useI18n()
 
 // Props
@@ -229,9 +395,29 @@ const saving = ref(false)
 const loading = ref(false)
 const allModels = ref<any[]>([])
 const hasFiles = ref(false)
+const initialStorageProvider = ref<string>('')
+const initialIndexingStrategy = ref<any>(null)
+const dsCount = ref(0)
+// 用户是否在分块设置中手动改过任何值。一旦为 true，就不再根据索引策略自动调整默认分块参数。
+const chunkingDirty = ref(false)
+
+// 仅 Wiki 索引模式下的分块预设：更大 chunk、无 overlap、关闭父子分块。
+// 该预设只在「创建模式」下、且用户尚未手动调整分块参数时生效，避免覆盖既有 KB 的配置。
+const WIKI_ONLY_CHUNKING_PRESET = {
+  chunkSize: 2048,
+  chunkOverlap: 0,
+  enableParentChild: false,
+} as const
+
+// 非 Wiki-only 场景下回落到的默认值（与 initFormData 保持一致）。
+const DEFAULT_CHUNKING_PRESET = {
+  chunkSize: 512,
+  chunkOverlap: 100,
+  enableParentChild: true,
+} as const
 
 const navItems = computed(() => {
-  const items = [
+  const items: { key: string; icon: string; label: string; badge?: number }[] = [
     { key: 'basic', icon: 'info-circle', label: t('knowledgeEditor.sidebar.basic') },
     { key: 'models', icon: 'control-platform', label: t('knowledgeEditor.sidebar.models') }
   ]
@@ -240,14 +426,18 @@ const navItems = computed(() => {
   } else {
     items.push(
       { key: 'parser', icon: 'file-search', label: t('settings.parserEngine') },
+      { key: 'multimodal', icon: 'image', label: t('knowledgeEditor.sidebar.multimodal') },
+      { key: 'asr', icon: 'sound', label: t('knowledgeEditor.sidebar.asr') },
       { key: 'storage', icon: 'cloud', label: t('knowledgeEditor.sidebar.storage') },
       { key: 'chunking', icon: 'file-copy', label: t('knowledgeEditor.sidebar.chunking') },
       { key: 'graph', icon: 'chart-bubble', label: t('knowledgeEditor.sidebar.graph') },
       { key: 'advanced', icon: 'setting', label: t('knowledgeEditor.sidebar.advanced') }
     )
+    if (props.mode === 'edit' && props.kbId) {
+      items.push({ key: 'datasource', icon: 'cloud-download', label: t('knowledgeEditor.sidebar.datasource'), badge: dsCount.value || undefined })
+    }
   }
-  // 只在编辑模式下显示共享标签页
-  if (props.mode === 'edit' && props.kbId) {
+  if (props.mode === 'edit' && props.kbId && !authStore.isLiteMode) {
     items.push({ key: 'share', icon: 'share', label: t('knowledgeEditor.sidebar.share') })
   }
   return items
@@ -290,21 +480,27 @@ const initFormData = (type: 'document' | 'faq' = 'document') => {
     },
     modelConfig: {
       llmModelId: '',
-      embeddingModelId: ''
+      embeddingModelId: '',
+      wikiSynthesisModelId: '',
     },
     chunkingConfig: {
       chunkSize: 512,
       chunkOverlap: 100,
       separators: ['\n\n', '\n', '。', '！', '？', ';', '；'],
       parserEngineRules: undefined as any,
-      enableParentChild: false,
+      enableParentChild: true,
       parentChunkSize: 4096,
       childChunkSize: 384
     },
-    storageProvider: 'local' as string,
+    storageProvider: '' as string,
     multimodalConfig: {
       enabled: false,
       vllmModelId: ''
+    },
+    asrConfig: {
+      enabled: false,
+      modelId: '',
+      language: ''
     },
     nodeExtractConfig: {
       enabled: false,
@@ -321,8 +517,19 @@ const initFormData = (type: 'document' | 'faq' = 'document') => {
       }>
     },
     questionGenerationConfig: {
-      enabled: false,
+      enabled: true,
       questionCount: 3
+    },
+    wikiConfig: {
+      synthesisModelId: '',
+      maxPagesPerIngest: 0,
+      extractionGranularity: 'standard' as 'focused' | 'standard' | 'exhaustive',
+    },
+    indexingStrategy: {
+      vectorEnabled: true,
+      keywordEnabled: true,
+      wikiEnabled: false,
+      graphEnabled: false,
     },
   }
 }
@@ -370,7 +577,8 @@ const loadKBData = async () => {
       },
       modelConfig: {
         llmModelId: kb.summary_model_id || '',
-        embeddingModelId: kb.embedding_model_id || ''
+        embeddingModelId: kb.embedding_model_id || '',
+        wikiSynthesisModelId: kb.wiki_config?.synthesis_model_id || ''
       },
       chunkingConfig: {
         chunkSize: kb.chunking_config?.chunk_size || 512,
@@ -381,10 +589,15 @@ const loadKBData = async () => {
         parentChunkSize: kb.chunking_config?.parent_chunk_size || 4096,
         childChunkSize: kb.chunking_config?.child_chunk_size || 384
       },
-      storageProvider: (kb.storage_config?.provider || 'local') as string,
+      storageProvider: (kb.storage_provider_config?.provider || kb.storage_config?.provider || 'local') as string,
       multimodalConfig: {
         enabled: !!kb.vlm_config?.enabled,
         vllmModelId: kb.vlm_config?.model_id || ''
+      },
+      asrConfig: {
+        enabled: !!kb.asr_config?.enabled,
+        modelId: kb.asr_config?.model_id || '',
+        language: kb.asr_config?.language || ''
       },
       nodeExtractConfig: {
         enabled: kb.extract_config?.enabled || false,
@@ -400,7 +613,25 @@ const loadKBData = async () => {
         enabled: kb.question_generation_config?.enabled || false,
         questionCount: kb.question_generation_config?.question_count || 3
       },
+      wikiConfig: {
+        synthesisModelId: kb.wiki_config?.synthesis_model_id || '',
+        maxPagesPerIngest: kb.wiki_config?.max_pages_per_ingest || 0,
+        extractionGranularity: (
+          kb.wiki_config?.extraction_granularity === 'focused' ||
+          kb.wiki_config?.extraction_granularity === 'exhaustive'
+            ? kb.wiki_config.extraction_granularity
+            : 'standard'
+        ) as 'focused' | 'standard' | 'exhaustive',
+      },
+      indexingStrategy: {
+        vectorEnabled: kb.indexing_strategy?.vector_enabled ?? true,
+        keywordEnabled: kb.indexing_strategy?.keyword_enabled ?? true,
+        wikiEnabled: kb.indexing_strategy?.wiki_enabled ?? false,
+        graphEnabled: kb.indexing_strategy?.graph_enabled ?? false,
+      },
     }
+    initialStorageProvider.value = formData.value.storageProvider
+    initialIndexingStrategy.value = { ...formData.value.indexingStrategy }
   } catch (error) {
     console.error('Failed to load knowledge base data:', error)
     MessagePlugin.error(t('knowledgeEditor.messages.loadDataFailed'))
@@ -417,11 +648,82 @@ const handleModelConfigUpdate = (config: any) => {
   }
 }
 
+// 粒度选择器：从 formData.wikiConfig 读出并规范化，未知值回退到 'standard'，
+// 与后端 WikiExtractionGranularity.Normalize() 的契约保持一致。
+const resolvedGranularity = computed<'focused' | 'standard' | 'exhaustive'>(() => {
+  const g = formData.value?.wikiConfig?.extractionGranularity
+  if (g === 'focused' || g === 'standard' || g === 'exhaustive') {
+    return g
+  }
+  return 'standard'
+})
+
+const granularityHint = computed<string>(() => {
+  switch (resolvedGranularity.value) {
+    case 'focused':
+      return t('knowledgeEditor.wiki.granularityFocusedHint')
+    case 'exhaustive':
+      return t('knowledgeEditor.wiki.granularityExhaustiveHint')
+    default:
+      return t('knowledgeEditor.wiki.granularityStandardHint')
+  }
+})
+
+const handleGranularityChange = (value: string | number | boolean) => {
+  if (!formData.value) return
+  const next: 'focused' | 'standard' | 'exhaustive' =
+    value === 'focused' || value === 'exhaustive'
+      ? (value as 'focused' | 'exhaustive')
+      : 'standard'
+  formData.value.wikiConfig = {
+    ...formData.value.wikiConfig,
+    extractionGranularity: next,
+  }
+}
+
+const isIndexingLocked = computed(() => props.mode === 'edit' && hasFiles.value)
+
+const toggleVectorIndexing = () => {
+  if (!formData.value) return
+  if (isIndexingLocked.value) return
+  const next = !formData.value.indexingStrategy.vectorEnabled
+  formData.value.indexingStrategy.vectorEnabled = next
+  formData.value.indexingStrategy.keywordEnabled = next
+}
+
+const toggleWikiIndexing = () => {
+  if (!formData.value) return
+  if (isIndexingLocked.value) return
+  formData.value.indexingStrategy.wikiEnabled = !formData.value.indexingStrategy.wikiEnabled
+}
+
 const handleChunkingConfigUpdate = (config: any) => {
   if (formData.value) {
     formData.value.chunkingConfig = { ...config }
+    // 用户已经手动触达分块设置，后续索引策略切换不再覆盖这些值
+    chunkingDirty.value = true
   }
 }
+
+// 判断当前是否为「仅 Wiki 索引」：只开了 Wiki，关了向量/关键词检索
+const isWikiOnlyStrategy = computed(() => {
+  const s = formData.value?.indexingStrategy
+  if (!s) return false
+  return !!s.wikiEnabled && !s.vectorEnabled && !s.keywordEnabled
+})
+
+// 仅在创建模式、用户未改过分块设置时，随索引策略自动应用/撤销 Wiki-only 预设。
+// 编辑模式严格保持后端已有配置不变，避免误改。
+watch(isWikiOnlyStrategy, (wikiOnly) => {
+  if (props.mode !== 'create') return
+  if (!formData.value) return
+  if (chunkingDirty.value) return
+  const preset = wikiOnly ? WIKI_ONLY_CHUNKING_PRESET : DEFAULT_CHUNKING_PRESET
+  formData.value.chunkingConfig = {
+    ...formData.value.chunkingConfig,
+    ...preset,
+  }
+})
 
 const handleParserEngineRulesUpdate = (rules: any[]) => {
   if (formData.value) {
@@ -429,10 +731,28 @@ const handleParserEngineRulesUpdate = (rules: any[]) => {
   }
 }
 
-const handleMultimodalUpdate = (config: any) => {
-  if (formData.value) {
-    formData.value.multimodalConfig = { ...config }
+const handleMultimodalToggle = () => {
+  if (formData.value && !formData.value.multimodalConfig.enabled) {
+    formData.value.multimodalConfig.vllmModelId = ''
   }
+}
+
+const handleMultimodalVLLMChange = (modelId: string) => {
+  if (formData.value) {
+    formData.value.multimodalConfig.vllmModelId = modelId
+  }
+}
+
+const handleAddVLLMModel = () => {
+  uiStore.openSettings('models', 'vllm')
+}
+
+const handleAddASRModel = () => {
+  uiStore.openSettings('models', 'asr')
+}
+
+const handleAddWikiModel = () => {
+  uiStore.openSettings('models', 'knowledgeqa')
 }
 
 const handleStorageProviderUpdate = (value: string) => {
@@ -464,9 +784,20 @@ const validateForm = (): boolean => {
     return false
   }
 
-  // 验证模型配置 - 必须配置 embedding 和 summary 模型
-  if (!formData.value.modelConfig.embeddingModelId) {
-    MessagePlugin.warning(t('knowledgeEditor.messages.embeddingRequired'))
+  // 验证索引策略 — 文档类型至少需要开启一种
+  if (formData.value.type !== 'faq') {
+    const s = formData.value.indexingStrategy
+    if (s && !s.vectorEnabled && !s.keywordEnabled && !s.wikiEnabled && !s.graphEnabled) {
+      MessagePlugin.warning(t('knowledgeEditor.indexing.atLeastOne'))
+      currentSection.value = 'basic'
+      return false
+    }
+  }
+
+  // 验证模型配置 - embedding 模型仅在检索索引启用时必须
+  const needsEmbedding = formData.value.indexingStrategy?.vectorEnabled || formData.value.indexingStrategy?.keywordEnabled
+  if (needsEmbedding && !formData.value.modelConfig.embeddingModelId) {
+    MessagePlugin.warning(t('knowledgeEditor.indexing.embeddingRequired'))
     currentSection.value = 'models'
     return false
   }
@@ -478,13 +809,10 @@ const validateForm = (): boolean => {
   }
 
   // 验证多模态配置（如果启用）
-  if (formData.value.multimodalConfig.enabled) {
-    const validation = (advancedSettingsRef.value as any)?.validateMultimodal?.()
-    if (validation && !validation.valid) {
-      MessagePlugin.warning(validation.message || t('knowledgeEditor.messages.multimodalInvalid'))
-      currentSection.value = 'advanced'
-      return false
-    }
+  if (formData.value.multimodalConfig.enabled && !formData.value.multimodalConfig.vllmModelId) {
+    MessagePlugin.warning(t('knowledgeEditor.messages.multimodalInvalid'))
+    currentSection.value = 'multimodal'
+    return false
   }
 
   if (formData.value.type === 'faq' && !formData.value.faqConfig?.indexMode) {
@@ -528,21 +856,26 @@ const buildSubmitData = () => {
       : ''
   }
 
+  // 添加ASR语音识别配置
+  data.asr_config = {
+    enabled: formData.value.asrConfig?.enabled || false,
+    model_id: formData.value.asrConfig?.enabled
+      ? (formData.value.asrConfig?.modelId || '')
+      : '',
+    language: formData.value.asrConfig?.language || ''
+  }
+
   // 存储引擎：仅传 provider，参数从全局设置读取
+  // Write to storage_provider_config (authoritative) + storage_config (legacy dual-write)
+  data.storage_provider_config = {
+    provider: formData.value.storageProvider || 'local'
+  }
   data.storage_config = {
     provider: formData.value.storageProvider || 'local'
   }
 
-  // 添加知识图谱配置
-  if (formData.value.nodeExtractConfig.enabled) {
-    data.extract_config = {
-      enabled: true,
-      text: formData.value.nodeExtractConfig.text,
-      tags: formData.value.nodeExtractConfig.tags,
-      nodes: formData.value.nodeExtractConfig.nodes,
-      relations: formData.value.nodeExtractConfig.relations
-    }
-  }
+  // 添加知识图谱配置 — now synced via indexingStrategy.graphEnabled
+  // extract_config is sent below along with indexing_strategy
 
   // 添加问题生成配置
   if (formData.value.questionGenerationConfig?.enabled) {
@@ -559,6 +892,37 @@ const buildSubmitData = () => {
     }
   }
 
+  // Wiki enablement is carried solely by indexing_strategy.wiki_enabled.
+  // wiki_config only holds wiki-specific tunables.
+  if (formData.value.type !== 'faq') {
+    data.wiki_config = {
+      synthesis_model_id: formData.value.modelConfig?.wikiSynthesisModelId || '',
+      max_pages_per_ingest: formData.value.wikiConfig?.maxPagesPerIngest || 0,
+      extraction_granularity: formData.value.wikiConfig?.extractionGranularity || 'standard',
+    }
+  }
+
+  // Send indexing strategy
+  if (formData.value.type !== 'faq') {
+    data.indexing_strategy = {
+      vector_enabled: formData.value.indexingStrategy?.vectorEnabled ?? true,
+      keyword_enabled: formData.value.indexingStrategy?.keywordEnabled ?? true,
+      wiki_enabled: formData.value.indexingStrategy?.wikiEnabled ?? false,
+      graph_enabled: formData.value.indexingStrategy?.graphEnabled ?? false,
+    }
+  }
+
+  // Sync extract_config.enabled from indexingStrategy.graphEnabled
+  if (formData.value.indexingStrategy?.graphEnabled && formData.value.nodeExtractConfig?.enabled) {
+    data.extract_config = {
+      enabled: true,
+      text: formData.value.nodeExtractConfig.text,
+      tags: formData.value.nodeExtractConfig.tags,
+      nodes: formData.value.nodeExtractConfig.nodes,
+      relations: formData.value.nodeExtractConfig.relations
+    }
+  }
+
   return data
 }
 
@@ -568,6 +932,34 @@ const handleSubmit = async () => {
     return
   }
 
+  // 编辑模式下，若已有文件且存储引擎发生了变化，弹窗确认
+  if (
+    props.mode === 'edit' &&
+    hasFiles.value &&
+    formData.value &&
+    initialStorageProvider.value &&
+    formData.value.storageProvider !== initialStorageProvider.value
+  ) {
+    const dialog = DialogPlugin.confirm({
+      header: t('common.confirm'),
+      body: t('knowledgeEditor.messages.storageChangeConfirm'),
+      confirmBtn: t('common.confirm'),
+      cancelBtn: t('common.cancel'),
+      onConfirm: () => {
+        dialog.destroy()
+        doSubmit()
+      },
+      onCancel: () => {
+        dialog.destroy()
+      },
+    })
+    return
+  }
+
+  doSubmit()
+}
+
+const doSubmit = async () => {
   saving.value = true
   try {
     const data = buildSubmitData()
@@ -589,12 +981,27 @@ const handleSubmit = async () => {
         throw new Error(t('knowledgeEditor.messages.missingId'))
       }
 
-      // 1. 更新基本信息（名称、描述）和 FAQ 配置
+      // 1. 更新基本信息（名称、描述）和 FAQ/Wiki 配置
       const updateConfig: any = {}
       if (formData.value.type === 'faq' && formData.value.faqConfig) {
         updateConfig.faq_config = {
           index_mode: formData.value.faqConfig.indexMode || 'question_only',
           question_index_mode: formData.value.faqConfig.questionIndexMode || 'separate'
+        }
+      }
+      if (formData.value.wikiConfig && formData.value.type !== 'faq') {
+        updateConfig.wiki_config = {
+          synthesis_model_id: formData.value.modelConfig?.wikiSynthesisModelId || '',
+          max_pages_per_ingest: formData.value.wikiConfig.maxPagesPerIngest || 0,
+          extraction_granularity: formData.value.wikiConfig.extractionGranularity || 'standard',
+        }
+      }
+      if (formData.value.type !== 'faq') {
+        updateConfig.indexing_strategy = {
+          vector_enabled: formData.value.indexingStrategy?.vectorEnabled ?? true,
+          keyword_enabled: formData.value.indexingStrategy?.keywordEnabled ?? true,
+          wiki_enabled: formData.value.indexingStrategy?.wikiEnabled ?? false,
+          graph_enabled: formData.value.indexingStrategy?.graphEnabled ?? false,
         }
       }
       await updateKnowledgeBase(props.kbId, {
@@ -608,6 +1015,7 @@ const handleSubmit = async () => {
         llmModelId: data.summary_model_id,
         embeddingModelId: data.embedding_model_id,
         vlm_config: data.vlm_config,
+        asr_config: data.asr_config,
         documentSplitting: {
           chunkSize: data.chunking_config.chunk_size,
           chunkOverlap: data.chunking_config.chunk_overlap,
@@ -620,7 +1028,7 @@ const handleSubmit = async () => {
         multimodal: {
           enabled: !!data.vlm_config?.enabled
         },
-        storageProvider: data.storage_config?.provider || 'local',
+        storageProvider: data.storage_provider_config?.provider || data.storage_config?.provider || 'local',
         nodeExtract: {
           enabled: data.extract_config?.enabled || false,
           text: data.extract_config?.text || '',
@@ -636,6 +1044,41 @@ const handleSubmit = async () => {
 
       await updateKBConfig(props.kbId, config)
       MessagePlugin.success(t('knowledgeEditor.messages.updateSuccess'))
+
+      // Check if indexing strategy changed and offer rebuild
+      if (hasFiles.value && initialIndexingStrategy.value && formData.value) {
+        const curr = formData.value.indexingStrategy
+        const prev = initialIndexingStrategy.value
+        const strategyChanged = (
+          curr.vectorEnabled !== prev.vectorEnabled ||
+          curr.keywordEnabled !== prev.keywordEnabled ||
+          curr.wikiEnabled !== prev.wikiEnabled ||
+          curr.graphEnabled !== prev.graphEnabled
+        )
+        if (strategyChanged) {
+          const dialog = DialogPlugin.confirm({
+            header: t('knowledgeEditor.indexing.rebuildConfirmTitle'),
+            body: t('knowledgeEditor.indexing.rebuildConfirmBody', { count: '...' }),
+            confirmBtn: t('common.confirm'),
+            cancelBtn: t('common.cancel'),
+            onConfirm: async () => {
+              dialog.destroy()
+              try {
+                const result: any = await rebuildKBIndex(props.kbId!)
+                const count = result?.data?.document_count ?? 0
+                MessagePlugin.success(t('knowledgeEditor.indexing.rebuildSuccess', { count }))
+              } catch (e) {
+                console.error('Rebuild index failed:', e)
+              }
+            },
+            onCancel: () => {
+              dialog.destroy()
+              MessagePlugin.info(t('knowledgeEditor.indexing.rebuildSkip'))
+            },
+          })
+        }
+      }
+
       emit('success', props.kbId)
     }
     
@@ -653,8 +1096,11 @@ const resetState = () => {
   currentSection.value = 'basic'
   formData.value = null
   hasFiles.value = false
+  initialStorageProvider.value = ''
+  initialIndexingStrategy.value = null
   saving.value = false
   loading.value = false
+  chunkingDirty.value = false
 }
 
 // 关闭弹窗
@@ -726,7 +1172,7 @@ watch(
 .settings-modal {
   position: relative;
   width: 90vw;
-  max-width: 1100px;
+  max-width: 1000px;
   height: 85vh;
   max-height: 750px;
   background: var(--td-bg-color-container);
@@ -831,6 +1277,27 @@ watch(
   flex: 1;
 }
 
+.nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--td-bg-color-component);
+  color: var(--td-text-color-secondary);
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.nav-item.active .nav-badge {
+  background: var(--td-brand-color);
+  color: #fff;
+}
+
 .settings-content {
   flex: 1;
   display: flex;
@@ -860,7 +1327,7 @@ watch(
   .section-title {
     margin: 0 0 8px 0;
     font-family: "PingFang SC";
-    font-size: 16px;
+    font-size: 20px;
     font-weight: 600;
     color: var(--td-text-color-primary);
   }
@@ -879,7 +1346,7 @@ watch(
 }
 
 .form-item {
-  margin-bottom: 20px;
+  margin-bottom: 16px;
 
   &:last-child {
     margin-bottom: 0;
@@ -890,7 +1357,7 @@ watch(
   display: block;
   margin-bottom: 8px;
   font-family: "PingFang SC";
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 500;
   color: var(--td-text-color-primary);
 
@@ -904,6 +1371,103 @@ watch(
 .form-tip {
   margin-top: 6px;
   font-size: 12px;
+  color: var(--td-text-color-placeholder);
+}
+
+.granularity-radio-group {
+  margin-top: 4px;
+}
+
+.granularity-hint {
+  margin-top: 8px;
+  line-height: 1.6;
+  color: var(--td-text-color-secondary);
+  white-space: normal;
+  word-break: break-word;
+}
+
+.indexing-checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.indexing-check-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: 8px;
+  background: var(--td-bg-color-container);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.2s ease, background 0.2s ease;
+
+  &:hover {
+    border-color: var(--td-brand-color);
+  }
+
+  &.is-checked {
+    border-color: var(--td-brand-color);
+    background: var(--td-brand-color-light);
+  }
+
+  &.is-disabled {
+    cursor: not-allowed;
+    opacity: 0.7;
+
+    &:hover {
+      border-color: var(--td-component-stroke);
+    }
+
+    &.is-checked:hover {
+      border-color: var(--td-brand-color);
+    }
+  }
+
+  :deep(.t-checkbox__label) {
+    font-weight: 500;
+    color: var(--td-text-color-primary);
+  }
+}
+
+.locked-tip {
+  color: var(--td-warning-color);
+  margin-top: 8px;
+}
+
+// 禁用内部 checkbox 自身的点击事件，统一由卡片处理
+.indexing-check-box {
+  pointer-events: none;
+}
+
+.indexing-check-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.indexing-new-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  height: 16px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.4px;
+  color: var(--td-brand-color);
+  background: var(--td-brand-color-light);
+}
+
+.indexing-check-desc {
+  margin: 0;
+  padding-left: 24px;
+  font-size: 12px;
+  line-height: 18px;
   color: var(--td-text-color-placeholder);
 }
 
@@ -981,6 +1545,81 @@ watch(
         color: var(--td-text-color-placeholder);
       }
     }
+  }
+}
+
+// 多模态配置内联样式（与子组件 KBStorageSettings/KBAdvancedSettings 一致）
+.kb-multimodal-settings {
+  width: 100%;
+
+  .section-header {
+    margin-bottom: 32px;
+
+    h2 {
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--td-text-color-primary);
+      margin: 0 0 8px 0;
+    }
+
+    .section-description {
+      font-size: 14px;
+      color: var(--td-text-color-secondary);
+      margin: 0;
+      line-height: 1.5;
+    }
+  }
+
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .setting-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    padding: 20px 0;
+    border-bottom: 1px solid var(--td-component-stroke);
+
+    &:last-child {
+      border-bottom: none;
+    }
+  }
+
+  .setting-info {
+    flex: 1;
+    max-width: 65%;
+    padding-right: 24px;
+
+    label {
+      font-size: 15px;
+      font-weight: 500;
+      color: var(--td-text-color-primary);
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .desc {
+      font-size: 13px;
+      color: var(--td-text-color-secondary);
+      margin: 0;
+      line-height: 1.5;
+    }
+  }
+
+  .setting-control {
+    flex-shrink: 0;
+    min-width: 280px;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+  }
+
+  .required {
+    color: var(--td-error-color);
+    margin-left: 2px;
+    font-weight: 500;
   }
 }
 </style>

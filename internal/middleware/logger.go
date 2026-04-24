@@ -26,8 +26,16 @@ type loggerResponseBodyWriter struct {
 }
 
 // Write 重写Write方法，同时写入buffer和原始writer
+// 限制buffer大小，避免SSE等流式响应导致内存无限增长
 func (r loggerResponseBodyWriter) Write(b []byte) (int, error) {
-	r.body.Write(b)
+	if r.body.Len() < maxBodySize {
+		remaining := maxBodySize - r.body.Len()
+		if len(b) <= remaining {
+			r.body.Write(b)
+		} else {
+			r.body.Write(b[:remaining])
+		}
+	}
 	return r.ResponseWriter.Write(b)
 }
 
@@ -135,7 +143,9 @@ func Logger() gin.HandlerFunc {
 		start := time.Now()
 		path := c.Request.URL.Path
 		raw := c.Request.URL.RawQuery
-		if strings.HasPrefix(path, "/assets/") {
+
+		isWikiStats := strings.HasPrefix(path, "/api/v1/knowledgebase/") && strings.HasSuffix(path, "/wiki/stats")
+		if strings.HasPrefix(path, "/assets/") || isWikiStats {
 			c.Next()
 			return
 		}
@@ -182,12 +192,13 @@ func Logger() gin.HandlerFunc {
 		// 读取响应体
 		responseBodyStr := ""
 		if responseBody.Len() > 0 {
-			// 检查Content-Type，只记录JSON类型
 			contentType := c.Writer.Header().Get("Content-Type")
-			if strings.Contains(contentType, "application/json") ||
+			if strings.Contains(contentType, "text/event-stream") {
+				responseBodyStr = "[SSE流式响应，已跳过]"
+			} else if strings.Contains(contentType, "application/json") ||
 				strings.Contains(contentType, "text/") {
 				bodyBytes := responseBody.Bytes()
-				if len(bodyBytes) > maxBodySize {
+				if len(bodyBytes) >= maxBodySize {
 					responseBodyStr = string(bodyBytes[:maxBodySize]) + "... [内容过长，已截断]"
 				} else {
 					responseBodyStr = string(bodyBytes)

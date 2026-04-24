@@ -55,12 +55,17 @@ const (
 	ProviderLKEAP ProviderName = "lkeap"
 	// NVIDIA
 	ProviderNvidia ProviderName = "nvidia"
+	// Novita AI
+	ProviderNovita ProviderName = "novita"
+	// Azure OpenAI
+	ProviderAzureOpenAI ProviderName = "azure_openai"
 )
 
 // AllProviders 返回所有注册的提供者名称
 func AllProviders() []ProviderName {
 	return []ProviderName{
 		ProviderGeneric,
+		ProviderWeKnoraCloud,
 		ProviderAliyun,
 		ProviderZhipu,
 		ProviderVolcengine,
@@ -81,6 +86,8 @@ func AllProviders() []ProviderName {
 		ProviderLKEAP,
 		ProviderGPUStack,
 		ProviderNvidia,
+		ProviderNovita,
+		ProviderAzureOpenAI,
 	}
 }
 
@@ -218,6 +225,8 @@ func DetectProvider(baseURL string) ProviderName {
 		return ProviderSiliconFlow
 	case containsAny(baseURL, "api.jina.ai"):
 		return ProviderJina
+	case containsAny(baseURL, "openai.azure.com"):
+		return ProviderAzureOpenAI
 	case containsAny(baseURL, "api.openai.com"):
 		return ProviderOpenAI
 	case containsAny(baseURL, "api.deepseek.com"):
@@ -248,6 +257,10 @@ func DetectProvider(baseURL string) ProviderName {
 		return ProviderLKEAP
 	case containsAny(baseURL, "nvidia.com"):
 		return ProviderNvidia
+	case containsAny(baseURL, "api.novita.ai", "novita.ai"):
+		return ProviderNovita
+	case containsAny(baseURL, "weknora.weixin.qq.com"):
+		return ProviderWeKnoraCloud
 	default:
 		return ProviderGeneric
 	}

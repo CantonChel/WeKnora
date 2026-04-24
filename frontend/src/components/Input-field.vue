@@ -15,9 +15,16 @@ import AgentSelector from './AgentSelector.vue';
 import { getCaretCoordinates } from '@/utils/caret';
 import { listModels, type ModelConfig } from '@/api/model';
 import { listAgents, type CustomAgent, BUILTIN_QUICK_ANSWER_ID, BUILTIN_SMART_REASONING_ID } from '@/api/agent';
-import { getTenantWebSearchConfig } from '@/api/web-search';
+import { listWebSearchProviders, type WebSearchProviderEntity } from '@/api/web-search-provider';
 import { getConversationConfig, updateConversationConfig, type ConversationConfig } from '@/api/system';
 import { useI18n } from 'vue-i18n';
+import AttachmentUpload, { type AttachmentFile } from './AttachmentUpload.vue';
+import {
+  kbSatisfiesToolRequirements,
+  deriveKbFilterFromTools,
+  toolsConsumeFiles,
+  type ScopeCapabilities,
+} from '@/utils/tool-capabilities';
 
 const route = useRoute();
 const router = useRouter();
@@ -29,6 +36,52 @@ const { t } = useI18n();
 
 let query = ref("");
 const showKbSelector = ref(false);
+
+// Image upload state
+const uploadedImages = ref<Array<{ file: File; preview: string }>>([]);
+const imageInputRef = ref<HTMLInputElement>();
+const imageUploading = ref(false);
+
+// Attachment upload state
+const attachmentUploadRef = ref<InstanceType<typeof AttachmentUpload>>();
+const uploadedAttachments = ref<AttachmentFile[]>([]);
+
+const handleImageSelect = (event: Event) => {
+  const input = event.target as HTMLInputElement;
+  if (!input.files) return;
+  addImageFiles(Array.from(input.files));
+  input.value = '';
+};
+
+const addImageFiles = (files: File[]) => {
+  if (!isImageUploadEnabledByAgent.value) return;
+  const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+  const maxSize = 10 * 1024 * 1024;
+  for (const file of files) {
+    if (uploadedImages.value.length >= 5) {
+      MessagePlugin.warning(t('chat.imageTooMany'));
+      break;
+    }
+    if (!allowed.includes(file.type)) {
+      MessagePlugin.warning(t('chat.imageTypeSizeError'));
+      continue;
+    }
+    if (file.size > maxSize) {
+      MessagePlugin.warning(t('chat.imageTypeSizeError'));
+      continue;
+    }
+    uploadedImages.value.push({ file, preview: URL.createObjectURL(file) });
+  }
+};
+
+const removeImage = (index: number) => {
+  const removed = uploadedImages.value.splice(index, 1);
+  if (removed.length > 0) URL.revokeObjectURL(removed[0].preview);
+};
+
+const triggerImageUpload = () => {
+  imageInputRef.value?.click();
+};
 const atButtonRef = ref<HTMLElement>();
 const showAgentModeSelector = ref(false);
 const agentModeButtonRef = ref<HTMLElement>();
@@ -115,6 +168,11 @@ watch([selectedAgentId, agentKnowledgeBases, agentKBSelectionMode], ([newAgentId
     if (showMention.value) {
       loadMentionItems(mentionQuery.value, true);
     }
+    // Clear images when switching to an agent that doesn't support image upload
+    if (!isImageUploadEnabledByAgent.value && uploadedImages.value.length > 0) {
+      uploadedImages.value.forEach(img => URL.revokeObjectURL(img.preview));
+      uploadedImages.value = [];
+    }
   }
 }, { immediate: true });
 
@@ -143,6 +201,11 @@ watch([selectedAgentId, () => settingsStore.selectedAgentSourceTenantId], async 
 const agentWebSearchEnabled = computed(() => {
   if (!hasAgentConfig.value) return null; // null 表示不受智能体控制
   return currentAgentConfig.value?.web_search_enabled ?? true;
+});
+
+const agentWebSearchProviderId = computed(() => {
+  if (!hasAgentConfig.value) return '';
+  return currentAgentConfig.value?.web_search_provider_id || '';
 });
 
 // 网络搜索是否被智能体禁用（只读状态）- 只有明确设置为 false 时才禁用
@@ -177,6 +240,60 @@ const agentSupportedFileTypes = computed(() => {
   return currentAgentConfig.value?.supported_file_types || [];
 });
 
+// 智能体配置的工具列表，驱动 @ 菜单的 KB 兼容性过滤
+const agentAllowedTools = computed<string[]>(() => {
+  if (!hasAgentConfig.value) return [];
+  return currentAgentConfig.value?.allowed_tools || [];
+});
+
+// 从 KB 对象里抽能力位，优先用 backend 显式的 capabilities 字段；否则回退到 indexing_strategy，
+// 最后拿 kb.type === 'faq' 兜底。shared / owned / agent-scope 三路的 KB 响应结构一致。
+const kbToScopeCaps = (kb: any): Partial<ScopeCapabilities> => {
+  if (kb?.capabilities) {
+    return {
+      vector: !!kb.capabilities.vector,
+      keyword: !!kb.capabilities.keyword,
+      wiki: !!kb.capabilities.wiki,
+      graph: !!kb.capabilities.graph,
+      faq: !!kb.capabilities.faq,
+    };
+  }
+  const s = kb?.indexing_strategy;
+  return {
+    vector: s ? !!s.vector_enabled : false,
+    keyword: s ? !!s.keyword_enabled : false,
+    wiki: s ? !!s.wiki_enabled : false,
+    graph: s ? !!s.graph_enabled : false,
+    faq: kb?.type === 'faq',
+  };
+};
+
+// "all" 模式 + 智能体工具有 KB 依赖时的兼容性过滤；'selected'/'none' 不在这里二次过滤
+// （selected 由编辑器负责，none 已经空表）。
+const isKbCompatibleWithAgent = (kb: any): boolean => {
+  if (!hasAgentConfig.value) return true;
+  if (agentKBSelectionMode.value !== 'all') return true;
+  return kbSatisfiesToolRequirements(kbToScopeCaps(kb), agentAllowedTools.value);
+};
+
+// 仅在用户没输入搜索词、且是因智能体工具兼容性把列表清空的场景展示专用空态文案
+const mentionEmptyHint = computed(() => {
+  if (mentionQuery.value) return '';
+  if (!hasAgentConfig.value) return '';
+  if (agentKBSelectionMode.value !== 'all') return '';
+  // 列表为空 && 兼容性过滤器其实是有效的（否则"全部"不会被剔空）
+  if (mentionItems.value.length !== 0) return '';
+  const filter = deriveKbFilterFromTools(agentAllowedTools.value);
+  if (!filter) return '';
+  return t('mentionDetail.noCompatibleKbForAgent');
+});
+
+// 智能体是否启用了图片上传（多模态）
+const isImageUploadEnabledByAgent = computed(() => {
+  if (!hasAgentConfig.value) return false;
+  return currentAgentConfig.value?.image_upload_enabled === true;
+});
+
 // 模型选择是否被智能体锁定 - 已移除锁定逻辑，允许用户自由切换模型
 const isModelLockedByAgent = computed(() => {
   return false;
@@ -195,6 +312,9 @@ const mentionStartPos = ref(0);
 const isComposing = ref(false);
 const isMentionTriggeredByButton = ref(false);
 const mentionHasMore = ref(false);
+// 当前 @ 会话可见的 KB ID 集合（含工具兼容性过滤），分页加载文件时复用，
+// 避免 append 请求把不兼容 KB 的文件漏进来。`null` 表示"不受限制"（非智能体场景）
+const mentionAllowedKbIds = ref<Set<string> | null>(null);
 const mentionLoading = ref(false);
 const mentionOffset = ref(0);
 const MENTION_PAGE_SIZE = 20;
@@ -222,6 +342,10 @@ const props = defineProps({
   assistantMessageId: {
     type: String,
     required: false
+  },
+  embeddedMode: {
+    type: Boolean,
+    default: false
   }
 });
 
@@ -229,7 +353,6 @@ const isAgentEnabled = computed(() => settingsStore.isAgentEnabled);
 const isWebSearchEnabled = computed(() => settingsStore.isWebSearchEnabled);
 const selectedKbIds = computed(() => settingsStore.settings.selectedKnowledgeBases || []);
 const selectedFileIds = computed(() => settingsStore.settings.selectedFiles || []);
-const isWebSearchConfigured = ref(false);
 
 // 获取已选择的知识库信息
 const knowledgeBases = ref<Array<{ id: string; name: string; type?: 'document' | 'faq'; knowledge_count?: number; chunk_count?: number }>>([]);
@@ -378,10 +501,13 @@ const loadKnowledgeBases = async () => {
   try {
     const response: any = await listKnowledgeBases();
     if (response.data && Array.isArray(response.data)) {
-      const validKbs = response.data.filter((kb: any) =>
-        kb.embedding_model_id && kb.embedding_model_id !== '' &&
-        kb.summary_model_id && kb.summary_model_id !== ''
-      );
+      const validKbs = response.data.filter((kb: any) => {
+        if (!kb.summary_model_id || kb.summary_model_id === '') return false
+        const strategy = kb.indexing_strategy
+        const needsEmbedding = !strategy || strategy.vector_enabled || strategy.keyword_enabled
+        if (needsEmbedding && (!kb.embedding_model_id || kb.embedding_model_id === '')) return false
+        return true
+      });
       knowledgeBases.value = validKbs;
 
       // 拉取共享知识库（供 @ 提及与清理选中项时识别）
@@ -468,19 +594,29 @@ watch(selectedFileIds, () => {
   loadFiles();
 }, { immediate: true });
 
+const webSearchProviders = ref<WebSearchProviderEntity[]>([]);
+
+const isWebSearchConfigured = computed(() => {
+  const agentProviderId = agentWebSearchProviderId.value;
+  if (agentProviderId) {
+    return webSearchProviders.value.some(p => p.id === agentProviderId);
+  }
+
+  return webSearchProviders.value.some(p => p.is_default);
+});
+
 const loadWebSearchConfig = async () => {
   try {
-    const response: any = await getTenantWebSearchConfig();
-    const config = response?.data;
-    const configured = !!(config && config.provider);
-    isWebSearchConfigured.value = configured;
+    const response = await listWebSearchProviders();
+    const providers = (response as any)?.data;
+    webSearchProviders.value = Array.isArray(providers) ? providers : [];
 
-    if (!configured && settingsStore.isWebSearchEnabled) {
+    if (!isWebSearchConfigured.value && settingsStore.isWebSearchEnabled) {
       settingsStore.toggleWebSearch(false);
     }
   } catch (error) {
     console.error('Failed to load web search config:', error);
-    isWebSearchConfigured.value = false;
+    webSearchProviders.value = [];
     if (settingsStore.isWebSearchEnabled) {
       settingsStore.toggleWebSearch(false);
     }
@@ -756,13 +892,16 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
         const res: any = await listKnowledgeBases({ agent_id: agentId });
         const list = res?.data && Array.isArray(res.data) ? res.data : [];
         const orgLabel = sharedAgentOrgName.value || '';
+        // 保留 capabilities / indexing_strategy，后面过滤时要用
         availableKbs = list.map((kb: any) => ({
           id: kb.id,
           name: kb.name,
           type: kb.type || 'document',
           knowledge_count: kb.knowledge_count,
           chunk_count: kb.chunk_count,
-          org_name: orgLabel
+          org_name: orgLabel,
+          capabilities: kb.capabilities,
+          indexing_strategy: kb.indexing_strategy,
         }));
         sharedAgentKbList.value = list.map((kb: any) => ({
           id: kb.id,
@@ -788,7 +927,9 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
           type: s.knowledge_base.type || 'document',
           knowledge_count: s.knowledge_base.knowledge_count,
           chunk_count: s.knowledge_base.chunk_count,
-          org_name: s.org_name || ''
+          org_name: s.org_name || '',
+          capabilities: s.knowledge_base.capabilities,
+          indexing_strategy: s.knowledge_base.indexing_strategy,
         }));
       const ownIds = new Set(availableKbs.map((kb: any) => kb.id));
       sharedKbsForMention.forEach((kb: any) => {
@@ -801,13 +942,31 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
 
     if (hasAgentConfig.value) {
       const kbMode = agentKBSelectionMode.value;
+      // 共享智能体路径：`availableKbs` 已经来自 `listKnowledgeBases({agent_id})`,
+      // 后端按 kb_selection_mode + allowed_tools 做过权威过滤；前端不再重复一遍。
+      // 本人智能体路径：走 own KBs + user-shared KBs 合并，后端拿不到 agent 上下文，
+      // 所以 'selected' 要收敛到配置集合，'all' 要按工具派生的能力过滤。
+      const isSharedAgent = !!(sourceTenantId && agentId);
       if (kbMode === 'none') {
         availableKbs = [];
-      } else if (kbMode === 'selected') {
-        const configuredKbIds = agentKnowledgeBases.value;
-        availableKbs = availableKbs.filter((kb: any) => configuredKbIds.includes(kb.id));
+      } else if (!isSharedAgent) {
+        if (kbMode === 'selected') {
+          // 'selected' 完全信任用户在编辑器里的勾选；编辑器已经用 kb_filter 灰显
+          // 不兼容项，这里不再二次过滤，避免越权擦除用户明确的选择。
+          const configuredKbIds = agentKnowledgeBases.value;
+          availableKbs = availableKbs.filter((kb: any) => configuredKbIds.includes(kb.id));
+        } else if (kbMode === 'all') {
+          // 'all' 的语义是"全部兼容的 KB"——按工具派生的能力集合过滤，
+          // 避免 wiki-qa 选"全部"后 @ 出来一堆 wiki 工具跑不动的 KB。
+          availableKbs = availableKbs.filter((kb: any) => isKbCompatibleWithAgent(kb));
+        }
       }
     }
+
+    // 非智能体场景不限制文件过滤；智能体场景按当前 availableKbs 的 ID 集合过滤文件
+    mentionAllowedKbIds.value = hasAgentConfig.value
+      ? new Set(availableKbs.map((kb: any) => String(kb.id)))
+      : null;
 
     const kbs = availableKbs.filter((kb: any) =>
       !q || (kb.name && kb.name.toLowerCase().includes(q.toLowerCase()))
@@ -823,9 +982,14 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
   }
   
   // Fetch Files from API
-  // 如果智能体禁用了知识库，也不显示文件
+  // 仅当满足以下两点才加载文件：
+  //   1. 智能体确实会用到知识库（kb_selection_mode !== 'none'）；
+  //   2. 智能体启用的工具里至少有一个能消费 @ 的文件 ID
+  //      （比如 wiki-qa 全是 wiki_* 工具，用户 @ 的文件根本进不到任何工具里，就没必要展示）。
   let fileItems: any[] = [];
-  const shouldLoadFiles = !hasAgentConfig.value || agentKBSelectionMode.value !== 'none';
+  const kbModeAllowsFiles = !hasAgentConfig.value || agentKBSelectionMode.value !== 'none';
+  const toolsAllowFiles = !hasAgentConfig.value || toolsConsumeFiles(agentAllowedTools.value);
+  const shouldLoadFiles = kbModeAllowsFiles && toolsAllowFiles;
   
   if (shouldLoadFiles) {
     mentionLoading.value = true;
@@ -844,9 +1008,17 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
       console.log('[Mention] searchKnowledge response:', res);
       if (res.data && Array.isArray(res.data)) {
         let files = res.data;
-        if (!sourceTenantId && hasAgentConfig.value && agentKBSelectionMode.value === 'selected') {
-          const configuredKbIds = agentKnowledgeBases.value;
-          files = files.filter((f: any) => configuredKbIds.includes(f.knowledge_base_id ?? f.kb_id));
+        // 按当前 @ 会话的兼容 KB 集合过滤：
+        //   - 非智能体场景：`mentionAllowedKbIds` 为 null，跳过；
+        //   - 智能体场景（含 shared agent）：'selected' 会把 ID 收敛到用户勾的 KB，
+        //     'all' 会收敛到"兼容"的 KB，'none' 根本走不到这里（shouldLoadFiles=false）。
+        //   这样分页 append 也能用同一份集合，不再只兜住 'selected' + 非共享的分支。
+        if (mentionAllowedKbIds.value) {
+          const allowed = mentionAllowedKbIds.value;
+          files = files.filter((f: any) => {
+            const kbId = f.knowledge_base_id ?? f.kb_id;
+            return kbId != null && allowed.has(String(kbId));
+          });
         }
         const sharedKbOrgMap: Record<string, string> = {};
         (orgStore.sharedKnowledgeBases || []).forEach((s: any) => {
@@ -1285,7 +1457,10 @@ watch([selectedKbIds, selectedFileIds], ([kbIds, fileIds]) => {
   }
 }, { deep: true });
 
-const emit = defineEmits(['send-msg', 'stop-generation']);
+const emit = defineEmits<{
+  (e: 'send-msg', query: string, modelId: string, mentionedItems: any[], imageFiles: File[], attachmentFiles: AttachmentFile[]): void;
+  (e: 'stop-generation'): void;
+}>();
 
 const createSession = async (val: string) => {
   if (!val.trim()) {
@@ -1321,7 +1496,24 @@ const createSession = async (val: string) => {
     type: item.type,
     kb_type: item.type === 'kb' ? (item.kbType || 'document') : undefined
   }));
-  emit('send-msg', val, selectedModelId.value, mentionedItems);
+  const imageFiles = uploadedImages.value.map(img => img.file);
+  const attachmentFiles = uploadedAttachments.value;
+  
+  // Blur the textarea BEFORE emitting, so that when the parent navigates away
+  // and Vue unmounts this component, TDesign's blur handler won't fire on a
+  // detached DOM element (which causes getComputedStyle to throw).
+  const textarea = getTextareaEl();
+  if (textarea) textarea.blur();
+  emit('send-msg', val, selectedModelId.value, mentionedItems, imageFiles, attachmentFiles);
+  
+  // Clean up image previews
+  uploadedImages.value.forEach(img => URL.revokeObjectURL(img.preview));
+  uploadedImages.value = [];
+  
+  // Clean up attachments
+  attachmentUploadRef.value?.clear();
+  uploadedAttachments.value = [];
+  
   clearvalue();
 }
 
@@ -1503,6 +1695,9 @@ const handleSelectAgent = (agent: CustomAgent, sourceTenantId?: string) => {
 }
 
 const clearvalue = () => {
+  // Guard: only clear when the textarea DOM element is still mounted,
+  // otherwise TDesign's autosize will call getComputedStyle on a non-Element.
+  if (!getTextareaEl()) return;
   query.value = "";
 }
 
@@ -1554,6 +1749,36 @@ const onKeydown = (val: string, event: { e: { preventDefault(): unknown; keyCode
   }
 }
 
+const onPaste = (e: ClipboardEvent) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  const imageFiles: File[] = [];
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if (file) imageFiles.push(file);
+    }
+  }
+  if (imageFiles.length > 0 && isImageUploadEnabledByAgent.value) {
+    e.preventDefault();
+    addImageFiles(imageFiles);
+  }
+};
+
+const onDrop = (e: DragEvent) => {
+  e.preventDefault();
+  const files = e.dataTransfer?.files;
+  if (!files) return;
+  const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
+  if (imageFiles.length > 0 && isImageUploadEnabledByAgent.value) {
+    addImageFiles(imageFiles);
+  }
+};
+
+const onDragOver = (e: DragEvent) => {
+  e.preventDefault();
+};
+
 const handleGoToWebSearchSettings = () => {
   uiStore.openSettings('websearch');
   if (route.path !== '/platform/settings') {
@@ -1579,17 +1804,16 @@ const getBuiltinAgentNotReadyReasons = (agent: CustomAgent, isAgentMode: boolean
   const reasons: string[] = []
   const config = agent.config || {}
   
-  // 检查对话模型（Summary Model）
-  if (!config.model_id || config.model_id.trim() === '') {
-    reasons.push(t('input.customAgentMissingSummaryModel'))
-  }
+  // 内置智能体会自动回退到租户的默认模型，因此不再在前端强制校验 model_id
   
-  // 检查重排模型（Rerank Model）- 如果使用知识库则需要
-  if (config.kb_selection_mode !== 'none') {
-    if (!config.rerank_model_id || config.rerank_model_id.trim() === '') {
-      reasons.push(t('input.customAgentMissingRerankModel'))
-    }
-  }
+  // 检查重排模型（Rerank Model）- 仅当允许使用 knowledge_search 工具时需要
+  // 内置智能体允许重排模型为空（使用默认配置）
+  // const hasKnowledgeSearchTool = config.allowed_tools && config.allowed_tools.includes('knowledge_search')
+  // if (hasKnowledgeSearchTool) {
+  //   if (!config.rerank_model_id || config.rerank_model_id.trim() === '') {
+  //     reasons.push(t('input.customAgentMissingRerankModel'))
+  //   }
+  // }
   
   // Agent 模式还需要检查允许的工具
   if (isAgentMode) {
@@ -1610,8 +1834,9 @@ const getCustomAgentNotReadyReasons = (agent: CustomAgent): string[] => {
   if (!config.model_id || config.model_id.trim() === '') {
     reasons.push(t('input.customAgentMissingSummaryModel'))
   }
-  // 检查重排模型（Rerank Model）- 如果使用知识库则需要
-  if (config.kb_selection_mode !== 'none') {
+  // 检查重排模型（Rerank Model）- 仅当允许使用 knowledge_search 工具时需要
+  const hasKnowledgeSearchTool = config.allowed_tools && config.allowed_tools.includes('knowledge_search')
+  if (hasKnowledgeSearchTool) {
     if (!config.rerank_model_id || config.rerank_model_id.trim() === '') {
       reasons.push(t('input.customAgentMissingRerankModel'))
     }
@@ -1730,11 +1955,44 @@ onBeforeRouteUpdate((to, from, next) => {
   next()
 })
 
+defineExpose({
+  triggerSend(text: string) {
+    if (!text.trim()) return;
+    query.value = text;
+    nextTick(() => createSession(text));
+  }
+});
+
 </script>
 <template>
-  <div class="answers-input">
+  <div class="answers-input" @drop="onDrop" @dragover="onDragOver">
+    <!-- Hidden file input for image upload -->
+    <input
+      ref="imageInputRef"
+      type="file"
+      accept="image/jpeg,image/png,image/gif,image/webp"
+      multiple
+      style="display:none"
+      @change="handleImageSelect"
+    />
     <!-- 富文本输入框容器 -->
     <div class="rich-input-container">
+        <!-- 图片预览区域 -->
+      <div v-if="uploadedImages.length > 0" class="image-preview-bar">
+        <div v-for="(img, idx) in uploadedImages" :key="idx" class="image-preview-item">
+          <img :src="img.preview" class="image-preview-thumb" />
+          <span class="image-preview-remove" @click="removeImage(idx)">×</span>
+        </div>
+      </div>
+      
+      <!-- 附件列表区域 (由 AttachmentUpload 组件渲染) -->
+      <AttachmentUpload
+        ref="attachmentUploadRef"
+        :max-files="5"
+        :max-size="20"
+        @update:files="uploadedAttachments = $event"
+      />
+      
         <!-- 选中的知识库和文件标签（显示在输入框内顶部） -->
       <div v-if="allSelectedItems.length > 0" class="selected-tags-inline">
         <span 
@@ -1771,6 +2029,7 @@ onBeforeRouteUpdate((to, from, next) => {
         @input="onInput"
         @compositionstart="onCompositionStart"
         @compositionend="onCompositionEnd"
+        @paste="onPaste"
       />
     </div>
     
@@ -1782,6 +2041,7 @@ onBeforeRouteUpdate((to, from, next) => {
         :items="mentionItems"
         :hasMore="mentionHasMore"
         :loading="mentionLoading"
+        :emptyHint="mentionEmptyHint"
         v-model:activeIndex="mentionActiveIndex"
         @select="onMentionSelect"
         @loadMore="loadMoreMentionItems"
@@ -1791,7 +2051,7 @@ onBeforeRouteUpdate((to, from, next) => {
     <!-- 控制栏 -->
     <div class="control-bar">
       <!-- 左侧控制按钮 -->
-      <div class="control-left">
+      <div class="control-left" v-if="!embeddedMode">
         <!-- Agent 模式切换按钮 -->
         <div 
           ref="agentModeButtonRef"
@@ -1864,6 +2124,50 @@ onBeforeRouteUpdate((to, from, next) => {
               <line x1="2.94" y1="5.5" x2="15.06" y2="5.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
               <line x1="2.94" y1="12.5" x2="15.06" y2="12.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
             </svg>
+          </div>
+        </t-tooltip>
+
+        <!-- 图片上传按钮 -->
+        <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
+          <template #content>
+            <div v-if="!isImageUploadEnabledByAgent" class="tooltip-with-link">
+              <span>{{ $t('input.imageUploadDisabledByAgent') }}</span>
+              <a href="#" @click.prevent="handleGoToAgentSettings('model')">{{ $t('input.goToAgentSettings') }}</a>
+            </div>
+            <span v-else>{{ $t('chat.imageUploadTooltip') }}</span>
+          </template>
+          <div
+            class="control-btn image-upload-btn"
+            :class="{ 
+              'active': uploadedImages.length > 0,
+              'disabled': !isImageUploadEnabledByAgent
+            }"
+            @click.stop="isImageUploadEnabledByAgent && triggerImageUpload()"
+          >
+            <svg width="18" height="18" viewBox="0 0 1024 1024" fill="currentColor" class="control-icon">
+              <path d="M896 128H128c-35.3 0-64 28.7-64 64v640c0 35.3 28.7 64 64 64h768c35.3 0 64-28.7 64-64V192c0-35.3-28.7-64-64-64zM128 832V192h768l0.1 640H128z"/>
+              <path d="M352 448a96 96 0 1 0 0-192 96 96 0 0 0 0 192z"/>
+              <path d="M128 768l224-288 160 160 192-256L896 640v128H128z"/>
+            </svg>
+            <span v-if="uploadedImages.length > 0" class="image-count">{{ uploadedImages.length }}</span>
+          </div>
+        </t-tooltip>
+
+        <!-- 附件上传按钮 -->
+        <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
+          <template #content>
+            <span>{{ uploadedAttachments.length > 0 ? $t('chat.attachmentWithCount', { count: uploadedAttachments.length }) : $t('chat.attachmentUploadTooltip') }}</span>
+          </template>
+          <div
+            class="control-btn attachment-upload-btn"
+            :class="{ 'active': uploadedAttachments.length > 0 }"
+            @click.stop="attachmentUploadRef?.triggerFileSelect()"
+          >
+            <!-- 回形针图标 -->
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="control-icon">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+            </svg>
+            <span v-if="uploadedAttachments.length > 0" class="attachment-count">{{ uploadedAttachments.length }}</span>
           </div>
         </t-tooltip>
 
@@ -2008,13 +2312,17 @@ const getImgSrc = (url: string) => {
   z-index: 99;
   bottom: 60px;
   left: 50%;
-  transform: translateX(-400px);
+  transform: translateX(-50%);
+  width: 100%;
+  display: flex;
+  justify-content: center;
 }
 
 /* 富文本输入框容器 */
 .rich-input-container {
   position: relative;
-  width: 800px;
+  width: 100%;
+  max-width: 800px;
   background: var(--td-bg-color-container, #FFF);
   border-radius: 12px;
   border: .5px solid var(--td-component-border, #E7E7E7);
@@ -2379,6 +2687,127 @@ const getImgSrc = (url: string) => {
   color: var(--td-brand-color);
 }
 
+/* Image upload */
+.image-upload-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  min-width: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  color: var(--td-text-color-secondary, #666);
+
+  &:hover {
+    background: var(--td-bg-color-secondarycontainer-hover, #f0f0f0);
+    color: var(--td-text-color-primary, #333);
+  }
+
+  &.active {
+    background: rgba(16, 185, 129, 0.1);
+    color: #07C05F;
+  }
+
+  .image-count {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    background: #07C05F;
+    color: #fff;
+    font-size: 10px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+  }
+}
+
+/* Attachment upload */
+.attachment-upload-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  min-width: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  color: var(--td-text-color-secondary, #666);
+
+  &:hover {
+    background: var(--td-bg-color-secondarycontainer-hover, #f0f0f0);
+    color: var(--td-text-color-primary, #333);
+  }
+
+  &.active {
+    background: rgba(16, 185, 129, 0.1);
+    color: #07C05F;
+  }
+
+  .attachment-count {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    background: #07C05F;
+    color: #fff;
+    font-size: 10px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+  }
+}
+
+.image-preview-bar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px 4px;
+  flex-wrap: wrap;
+}
+
+.image-preview-item {
+  position: relative;
+  width: 60px;
+  height: 60px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--td-border-level-1-color, #e7e7e7);
+
+  .image-preview-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .image-preview-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 16px;
+    height: 16px;
+    background: rgba(0, 0, 0, 0.5);
+    color: #fff;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1;
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.7);
+    }
+  }
+}
+
 .websearch-btn {
   width: 28px;
   height: 28px;
@@ -2509,6 +2938,18 @@ const getImgSrc = (url: string) => {
     background: var(--td-brand-color);
     border-radius: 50%;
     display: block;
+    animation: stopBtnPulse 1.5s ease-in-out infinite;
+  }
+}
+
+@keyframes stopBtnPulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(0.75);
+    opacity: 0.6;
   }
 }
 

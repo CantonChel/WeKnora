@@ -6,7 +6,8 @@
     </div>
 
     <div class="settings-group">
-      <!-- Question Generation feature -->
+      <!-- Question Generation feature (only useful for RAG indexing) -->
+      <template v-if="ragEnabled !== false">
       <div class="setting-row">
         <div class="setting-info">
           <label>{{ $t('knowledgeEditor.advanced.questionGeneration.label') }}</label>
@@ -41,42 +42,7 @@
           </div>
         </div>
       </div>
-
-      <!-- Multimodal feature：仅选择多模态模型，存储引擎在「存储引擎」页配置 -->
-      <div class="setting-row">
-        <div class="setting-info">
-          <label>{{ $t('knowledgeEditor.advanced.multimodal.label') }}</label>
-          <p class="desc">{{ $t('knowledgeEditor.advanced.multimodal.description') }}</p>
-        </div>
-        <div class="setting-control">
-          <t-switch
-            v-model="localMultimodal.enabled"
-            @change="handleMultimodalToggle"
-            size="medium"
-          />
-        </div>
-      </div>
-
-      <!-- 多模态开启时仅配置 VLLM 模型 -->
-      <div v-if="localMultimodal.enabled" class="subsection">
-        <div class="setting-row">
-          <div class="setting-info">
-            <label>{{ $t('knowledgeEditor.advanced.multimodal.vllmLabel') }} <span class="required">*</span></label>
-            <p class="desc">{{ $t('knowledgeEditor.advanced.multimodal.vllmDescription') }}</p>
-          </div>
-          <div class="setting-control">
-            <ModelSelector
-              ref="vllmSelectorRef"
-              model-type="VLLM"
-              :selected-model-id="localMultimodal.vllmModelId"
-              :all-models="allModels"
-              @update:selected-model-id="handleVLLMChange"
-              @add-model="handleAddModel('vllm')"
-              :placeholder="$t('knowledgeEditor.advanced.multimodal.vllmPlaceholder')"
-            />
-          </div>
-        </div>
-      </div>
+      </template>
 
     </div>
   </div>
@@ -84,15 +50,6 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import ModelSelector from '@/components/ModelSelector.vue'
-import { useUIStore } from '@/stores/ui'
-
-const uiStore = useUIStore()
-
-interface MultimodalConfig {
-  enabled: boolean
-  vllmModelId?: string
-}
 
 interface QuestionGenerationConfig {
   enabled: boolean
@@ -100,28 +57,20 @@ interface QuestionGenerationConfig {
 }
 
 interface Props {
-  multimodal: MultimodalConfig
   questionGeneration?: QuestionGenerationConfig
+  ragEnabled?: boolean
   allModels?: any[]
 }
 
 const props = defineProps<Props>()
 
 const emit = defineEmits<{
-  'update:multimodal': [value: MultimodalConfig]
   'update:questionGeneration': [value: QuestionGenerationConfig]
 }>()
 
-const localMultimodal = ref<MultimodalConfig>({ ...props.multimodal })
 const localQuestionGeneration = ref<QuestionGenerationConfig>(
   props.questionGeneration || { enabled: false, questionCount: 3 }
 )
-
-const vllmSelectorRef = ref()
-
-watch(() => props.multimodal, (newVal) => {
-  localMultimodal.value = { ...newVal }
-}, { deep: true })
 
 watch(() => props.questionGeneration, (newVal) => {
   if (newVal) {
@@ -138,22 +87,6 @@ const handleQuestionGenerationToggle = () => {
 
 const handleQuestionGenerationChange = () => {
   emit('update:questionGeneration', localQuestionGeneration.value)
-}
-
-const handleMultimodalToggle = () => {
-  if (!localMultimodal.value.enabled) {
-    localMultimodal.value.vllmModelId = ''
-  }
-  emit('update:multimodal', localMultimodal.value)
-}
-
-const handleVLLMChange = (modelId: string) => {
-  localMultimodal.value.vllmModelId = modelId
-  emit('update:multimodal', localMultimodal.value)
-}
-
-const handleAddModel = (subSection: string) => {
-  uiStore.openSettings('models', subSection)
 }
 </script>
 
@@ -199,8 +132,8 @@ const handleAddModel = (subSection: string) => {
 }
 
 .setting-info {
-  flex: 1;
-  max-width: 65%;
+  flex: 0 0 40%;
+  max-width: 40%;
   padding-right: 24px;
 
   label {
@@ -227,8 +160,8 @@ const handleAddModel = (subSection: string) => {
 }
 
 .setting-control {
-  flex-shrink: 0;
-  min-width: 280px;
+  flex: 0 0 55%;
+  max-width: 55%;
   display: flex;
   justify-content: flex-end;
   align-items: center;
@@ -250,4 +183,3 @@ const handleAddModel = (subSection: string) => {
 }
 
 </style>
-

@@ -1,10 +1,21 @@
 import { get, post, put, del } from "../../utils/request";
 
 // 智能体配置
+// 智能推理下的智能体类型预设 ID
+// 'rag-qa'       : 经典文档/FAQ 分块 RAG
+// 'wiki-qa'      : Wiki 图谱导航问答
+// 'hybrid-rag-wiki': Wiki + 分块混合检索
+// 'custom'       : 完全自定义（不应用预设）
+export type AgentType = 'rag-qa' | 'wiki-qa' | 'hybrid-rag-wiki' | 'data-analysis' | 'custom';
+
 export interface CustomAgentConfig {
   // ===== 基础设置 =====
   agent_mode?: 'quick-answer' | 'smart-reasoning';  // 运行模式：quick-answer=RAG模式, smart-reasoning=ReAct Agent模式
+  // 智能推理模式下的类型预设，用于一键应用"系统提示词 + 工具 + KB 兼容性"组合
+  // 仅在 agent_mode === 'smart-reasoning' 时生效；quick-answer 模式忽略
+  agent_type?: AgentType;
   system_prompt?: string;           // 统一系统提示词（使用 {{web_search_status}} 占位符动态控制行为）
+  system_prompt_id?: string;        // 引用的 prompt template ID（预设会填入此字段）
   context_template?: string;        // 上下文模板（普通模式）
 
   // ===== 模型设置 =====
@@ -35,6 +46,13 @@ export interface CustomAgentConfig {
   // false: 根据 kb_selection_mode 自动检索知识库
   retrieve_kb_only_when_mentioned?: boolean;
 
+  // ===== 图片上传/多模态设置 =====
+  image_upload_enabled?: boolean;    // 是否启用图片上传（默认: false）
+  vlm_model_id?: string;            // VLM模型ID（图片分析用）
+  image_storage_provider?: string;   // 图片存储提供商
+  audio_upload_enabled?: boolean;    // 是否启用音频上传/ASR转录（默认: false）
+  asr_model_id?: string;            // ASR模型ID（音频转录用）
+
   // ===== 文件类型限制 =====
   // 支持的文件类型（如 ["csv", "xlsx", "xls"]）
   // 为空表示支持所有文件类型
@@ -42,6 +60,7 @@ export interface CustomAgentConfig {
 
   // ===== 网络搜索设置 =====
   web_search_enabled?: boolean;
+  web_search_provider_id?: string;
   web_search_max_results?: number;
 
   // ===== 多轮对话设置 =====
@@ -169,4 +188,137 @@ export interface PlaceholdersResponse {
 // 获取占位符定义
 export function getPlaceholders() {
   return get<{ data: PlaceholdersResponse }>('/api/v1/agents/placeholders');
+}
+
+// ===== 智能体类型预设 =====
+
+// 后端 kb_filter 结构（见 internal/types/agent_type_preset.go）
+export interface AgentTypeKBFilter {
+  any_of?: string[];   // KB 至少拥有其一
+  all_of?: string[];   // KB 必须全部拥有
+  none_of?: string[];  // KB 必须全部不拥有
+}
+
+// KB 能力标签（后端 types.KBCapabilities 的 JSON）
+export interface KBCapabilities {
+  vector: boolean;
+  keyword: boolean;
+  wiki: boolean;
+  graph: boolean;
+  faq: boolean;
+}
+
+// 预设的"自动填充"配置载荷：仅包含被预设覆盖的字段；其他字段不动
+export interface AgentTypePresetConfig {
+  system_prompt_id?: string;
+  temperature?: number;
+  max_iterations?: number;
+  allowed_tools?: string[];
+  retain_retrieval_history?: boolean;
+  faq_priority_enabled?: boolean;
+  web_search_enabled?: boolean;
+  supported_file_types?: string[];
+  kb_selection_mode?: 'all' | 'selected' | 'none';
+}
+
+export interface AgentTypePresetI18n {
+  label: string;
+  description: string;
+}
+
+export interface AgentTypePreset {
+  id: AgentType;
+  i18n: Record<string, AgentTypePresetI18n>;
+  config?: AgentTypePresetConfig;     // 为空表示"自定义"类型（无预设）
+  kb_filter?: AgentTypeKBFilter;      // 为空表示所有 KB 可选
+}
+
+// 拉取类型预设列表（编辑器用）
+export function getAgentTypePresets() {
+  return get<{ data: AgentTypePreset[] }>('/api/v1/agents/type-presets');
+}
+
+// ===== IM渠道 =====
+
+export interface IMChannel {
+  id: string;
+  tenant_id?: number;
+  agent_id: string;
+  platform: 'wecom' | 'feishu' | 'slack' | 'telegram' | 'dingtalk' | 'mattermost' | 'wechat';
+  name: string;
+  enabled: boolean;
+  mode: 'webhook' | 'websocket' | 'longpoll';
+  output_mode: 'stream' | 'full';
+  session_mode?: 'user' | 'thread';
+  knowledge_base_id?: string;
+  credentials: Record<string, any>;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function listIMChannels(agentId: string) {
+  return get<{ data: IMChannel[] }>(`/api/v1/agents/${agentId}/im-channels`);
+}
+
+export function createIMChannel(agentId: string, data: Partial<IMChannel>) {
+  return post<{ data: IMChannel }>(`/api/v1/agents/${agentId}/im-channels`, data);
+}
+
+export function updateIMChannel(id: string, data: Partial<IMChannel>) {
+  return put<{ data: IMChannel }>(`/api/v1/im-channels/${id}`, data);
+}
+
+export function deleteIMChannel(id: string) {
+  return del<{ success: boolean }>(`/api/v1/im-channels/${id}`);
+}
+
+export function toggleIMChannel(id: string) {
+  return post<{ data: IMChannel }>(`/api/v1/im-channels/${id}/toggle`);
+}
+
+// ===== 推荐问题 =====
+
+// 推荐问题
+export interface SuggestedQuestion {
+  question: string;
+  source: 'faq' | 'document' | 'agent_config' | 'wiki';
+  knowledge_base_id?: string;
+}
+
+// 获取智能体推荐问题
+// 根据智能体关联的知识库范围返回推荐问题，用于前端对话面板快捷提问
+export function getSuggestedQuestions(
+  agentId: string,
+  params?: { knowledge_base_ids?: string[]; knowledge_ids?: string[]; limit?: number }
+) {
+  const query = new URLSearchParams();
+  if (params?.knowledge_base_ids?.length) query.set('knowledge_base_ids', params.knowledge_base_ids.join(','));
+  if (params?.knowledge_ids?.length) query.set('knowledge_ids', params.knowledge_ids.join(','));
+  if (params?.limit) query.set('limit', String(params.limit));
+  const qs = query.toString();
+  return get<{ data: { questions: SuggestedQuestion[] } }>(`/api/v1/agents/${agentId}/suggested-questions${qs ? '?' + qs : ''}`);
+}
+// ===== WeChat QR Code Login =====
+
+export interface WeChatQRCodeResult {
+  qrcode_url: string;
+  qrcode: string;
+}
+
+export interface WeChatQRCodeStatus {
+  status: 'wait' | 'scaned' | 'confirmed' | 'expired';
+  credentials?: {
+    bot_token: string;
+    ilink_bot_id: string;
+    ilink_user_id: string;
+  };
+  baseurl?: string;
+}
+
+export function getWeChatQRCode() {
+  return post<{ data: WeChatQRCodeResult }>('/api/v1/wechat/qrcode');
+}
+
+export function pollWeChatQRCodeStatus(qrcode: string) {
+  return post<{ data: WeChatQRCodeStatus }>('/api/v1/wechat/qrcode/status', { qrcode });
 }

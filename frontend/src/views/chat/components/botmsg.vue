@@ -1,5 +1,5 @@
 <template>
-    <div class="bot_msg">
+    <div class="bot_msg" :class="{ 'is-embedded': embeddedMode }">
         <div style="display: flex;flex-direction: column; gap:8px">
             <!-- 显示@的知识库和文件（非 Agent 模式下显示） -->
             <div v-if="!session.isAgentMode && mentionedItems && mentionedItems.length > 0" class="mentioned_items">
@@ -31,6 +31,14 @@
                     <div v-for="(token, index) in markdownTokens" :key="index" v-html="renderToken(token)"></div>
                 </div>
             </div>
+            <!-- Streaming indicator (non-Agent mode) -->
+            <div v-if="hasActualContent && !session.is_completed" class="loading-indicator">
+                <div class="loading-typing">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+            </div>
             <!-- 复制和添加到知识库按钮 - 非 Agent 模式下显示 -->
             <div v-if="session.is_completed && (content || session.content)" class="answer-toolbar">
                 <t-button size="small" variant="outline" shape="round" @click.stop="handleCopyAnswer" :title="$t('agent.copy')">
@@ -52,14 +60,15 @@
     </div>
 </template>
 <script setup>
-import { onMounted, onBeforeUnmount, watch, computed, ref, reactive, defineProps, nextTick } from 'vue';
+import { onMounted, onBeforeUnmount, watch, computed, ref, reactive, defineProps, nextTick, onUpdated } from 'vue';
 import { marked } from 'marked';
+import markedKatex from 'marked-katex-extension';
+import 'katex/dist/katex.min.css';
 import docInfo from './docInfo.vue';
 import deepThink from './deepThink.vue';
 import AgentStreamDisplay from './AgentStreamDisplay.vue';
 import picturePreview from '@/components/picture-preview.vue';
 import { sanitizeHTML, safeMarkdownToHTML, createSafeImage, isValidImageURL, hydrateProtectedFileImages } from '@/utils/security';
-import { openMermaidFullscreen } from '@/utils/mermaidViewer';
 import { useI18n } from 'vue-i18n';
 import { MessagePlugin } from 'tdesign-vue-next';
 import { useUIStore } from '@/stores/ui';
@@ -70,17 +79,25 @@ import {
     replaceIncompleteImageWithPlaceholder
 } from '@/utils/chatMessageShared';
 import {
-    bindMermaidFullscreenEvents,
     createMermaidCodeRenderer,
     ensureMermaidInitialized,
     renderMermaidInContainer
 } from '@/utils/mermaidShared';
 
 marked.use({
-    mangle: false,
-    headerIds: false,
     breaks: true,  // 全局启用单个换行支持
 });
+
+marked.use(markedKatex({ throwOnError: false }));
+
+const preprocessMathDelimiters = (rawText) => {
+    if (!rawText || typeof rawText !== 'string') {
+        return '';
+    }
+    return rawText
+        .replace(/\\\[([\s\S]*?)\\\]/g, '$$$$$1$$$$')
+        .replace(/\\\(([\s\S]*?)\\\)/g, '$$$1$$');
+};
 
 ensureMermaidInitialized();
 
@@ -110,6 +127,10 @@ const props = defineProps({
     isFirstEnter: {
         type: Boolean,
         required: false
+    },
+    embeddedMode: {
+        type: Boolean,
+        default: false
     }
 });
 
@@ -128,12 +149,10 @@ const closePreImg = () => {
 // 创建自定义渲染器实例
 const customRenderer = new marked.Renderer();
 // 覆盖图片渲染方法
-customRenderer.image = function(href, title, text) {
-    // 验证图片 URL 是否安全
+customRenderer.image = function({href, title, text}){
     if (!isValidImageURL(href)) {
         return `<p>${t('error.invalidImageLink')}</p>`;
     }
-    // 使用安全的图片创建函数
     return createSafeImage(href, text || '', title || '');
 };
 
@@ -152,9 +171,10 @@ const markdownTokens = computed(() => {
     }
 
     const processed = replaceIncompleteImageWithPlaceholder(text);
+    const safeText = preprocessMathDelimiters(processed);
     
     // 首先对 Markdown 内容进行安全处理
-    const safeMarkdown = safeMarkdownToHTML(processed);
+    const safeMarkdown = safeMarkdownToHTML(safeText);
     
     // 使用 marked.lexer 分词
     return marked.lexer(safeMarkdown);
@@ -186,10 +206,6 @@ const renderToken = (token) => {
         return '';
     }
 };
-
-const myMarkdown = (res) => {
-    return marked.parse(res, { renderer })
-}
 
 // 获取实际内容
 const getActualContent = () => {
@@ -224,7 +240,7 @@ const handleAddToKnowledge = () => {
     const question = (props.userQuery || '').trim();
     const manualContent = buildManualMarkdown(question, content);
     const manualTitle = formatManualTitle(question);
-
+``
     uiStore.openManualEditor({
         mode: 'create',
         title: manualTitle,
@@ -250,30 +266,11 @@ const handleMarkdownImageClick = (e) => {
 
 // 渲染 Mermaid 图表的函数
 const renderMermaidDiagrams = async () => {
-    try {
-        const renderedCount = await renderMermaidInContainer(parentMd.value, renderedMermaidIds);
-        if (renderedCount > 0) {
-            nextTick(() => {
-                bindMermaidClickEvents();
-            });
-        }
-    } catch (error) {
-        console.error('Mermaid rendering error:', error);
-    }
-};
-
-// 已渲染的 mermaid 元素 ID 集合
-const renderedMermaidIds = new Set();
-
-// 为 Mermaid 容器绑定点击全屏事件（绑定在 div 上，不是 SVG 上）
-const bindMermaidClickEvents = () => {
-    bindMermaidFullscreenEvents(parentMd.value, (svgOuterHTML) => {
-        openMermaidFullscreen(svgOuterHTML);
-    });
+  await renderMermaidInContainer(parentMd.value);
 };
 
 // 监听内容变化并渲染 Mermaid - 只在会话完成后渲染
-watch(() => [props.content, props.session?.content, props.session?.is_completed], () => {
+onUpdated(() => {
     nextTick(async () => {
         await hydrateProtectedFileImages(parentMd.value);
         // 只在会话完成后渲染 mermaid
@@ -281,7 +278,7 @@ watch(() => [props.content, props.session?.content, props.session?.is_completed]
             renderMermaidDiagrams();
         }
     });
-}, { immediate: true });
+});
 
 onMounted(async () => {
     // 为 markdown-content 中的图片添加点击事件
@@ -305,11 +302,21 @@ onBeforeUnmount(() => {
 @import '../../../components/css/markdown.less';
 @import '../../../components/css/chat-message-shared.less';
 
+.bot_msg {
+    &.is-embedded {
+        width: 100%;
+        
+        :deep(.agent-stream-display) {
+            width: 100%;
+        }
+    }
+}
+
 // 内容包装器 - 与 Agent 模式的 answer 样式一致
 .content-wrapper {
     background: var(--td-bg-color-container);
     border-radius: 6px;
-    padding: 8px 12px;
+    padding: 8px 0px;
     transition: all 0.2s ease;
 }
 
@@ -545,6 +552,10 @@ onBeforeUnmount(() => {
 }
 
 .thinking-loading {
+    padding: 8px 0;
+}
+
+.loading-indicator {
     padding: 8px 0;
 }
 

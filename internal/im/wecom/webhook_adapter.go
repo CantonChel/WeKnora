@@ -22,7 +22,10 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -30,20 +33,58 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/im"
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
 )
 
-var httpClient = &http.Client{Timeout: 10 * time.Second}
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+const defaultAPIBaseURL = "https://qyapi.weixin.qq.com"
+
+// extraHostFromEndpoint returns the lowercased hostname from endpoint if it
+// differs from defaultEndpoint; otherwise returns "". Used to extend the SSRF
+// allowlist for private deployments.
+func extraHostFromEndpoint(endpoint, defaultEndpoint string) string {
+	if endpoint == "" || endpoint == defaultEndpoint {
+		return ""
+	}
+	if u, err := url.Parse(endpoint); err == nil {
+		return strings.ToLower(u.Hostname())
+	}
+	return ""
+}
+
+// validateEndpointURL checks that a custom endpoint URL uses a secure scheme
+// and does not point to a private/internal address, preventing accidental
+// credential leakage (e.g. access tokens sent to a rogue server).
+func validateEndpointURL(endpoint, defaultEndpoint, requiredScheme string) error {
+	if endpoint == "" || endpoint == defaultEndpoint {
+		return nil
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid endpoint URL: %w", err)
+	}
+	if u.Scheme != requiredScheme {
+		return fmt.Errorf("endpoint must use %s:// scheme, got %s://", requiredScheme, u.Scheme)
+	}
+	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
+		return fmt.Errorf("%w (for private deployments on internal networks, add the hostname to SSRF_WHITELIST)", err)
+	}
+	return nil
+}
 
 // WebhookAdapter implements im.Adapter for WeCom in webhook (self-built app callback) mode.
 // Messages arrive via HTTP callback; replies are sent via the WeCom REST API.
 type WebhookAdapter struct {
-	corpID         string
-	token          string
-	encodingAESKey string
-	aesKey         []byte
-	agentSecret    string
-	corpAgentID    int
+	corpID           string
+	token            string
+	encodingAESKey   string
+	aesKey           []byte
+	agentSecret      string
+	corpAgentID      int
+	apiBaseURL       string // WeCom API base URL (e.g. "https://qyapi.weixin.qq.com")
+	extraAllowedHost string // hostname from apiBaseURL for SSRF allowlist (empty if default)
 
 	// Token cache
 	tokenMu    sync.Mutex
@@ -51,21 +92,36 @@ type WebhookAdapter struct {
 	tokenExpAt time.Time
 }
 
+// Compile-time check that WebhookAdapter implements im.FileDownloader.
+var _ im.FileDownloader = (*WebhookAdapter)(nil)
+
 // NewWebhookAdapter creates a new WeCom webhook adapter.
-func NewWebhookAdapter(corpID, agentSecret, token, encodingAESKey string, corpAgentID int) (*WebhookAdapter, error) {
+// apiBaseURL overrides the default WeCom API base URL; empty uses the public cloud endpoint.
+func NewWebhookAdapter(corpID, agentSecret, token, encodingAESKey string, corpAgentID int, apiBaseURL string) (*WebhookAdapter, error) {
 	// Decode the AES key from base64
 	aesKey, err := base64.StdEncoding.DecodeString(encodingAESKey + "=")
 	if err != nil {
 		return nil, fmt.Errorf("decode encoding_aes_key: %w", err)
 	}
 
+	if apiBaseURL == "" {
+		apiBaseURL = defaultAPIBaseURL
+	}
+	apiBaseURL = strings.TrimRight(apiBaseURL, "/")
+
+	if err := validateEndpointURL(apiBaseURL, defaultAPIBaseURL, "https"); err != nil {
+		return nil, fmt.Errorf("invalid api_base_url: %w", err)
+	}
+
 	return &WebhookAdapter{
-		corpID:         corpID,
-		token:          token,
-		encodingAESKey: encodingAESKey,
-		aesKey:         aesKey,
-		agentSecret:    agentSecret,
-		corpAgentID:    corpAgentID,
+		corpID:           corpID,
+		token:            token,
+		encodingAESKey:   encodingAESKey,
+		aesKey:           aesKey,
+		agentSecret:      agentSecret,
+		corpAgentID:      corpAgentID,
+		apiBaseURL:       apiBaseURL,
+		extraAllowedHost: extraHostFromEndpoint(apiBaseURL, defaultAPIBaseURL),
 	}, nil
 }
 
@@ -146,55 +202,142 @@ func (a *WebhookAdapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, err
 		return nil, fmt.Errorf("decrypt message: %w", err)
 	}
 
+	// Log raw decrypted message for debugging
+	logger.Debugf(c.Request.Context(), "[WeCom] Raw decrypted callback: %s", string(decrypted))
+
 	var msg wecomMessage
 	if err := xml.Unmarshal(decrypted, &msg); err != nil {
 		return nil, fmt.Errorf("unmarshal decrypted message: %w", err)
 	}
 
-	// Only handle text messages
-	if msg.MsgType != "text" {
-		logger.Infof(c.Request.Context(), "[WeCom] Ignoring non-text message type: %s", msg.MsgType)
-		return nil, nil
-	}
+	logger.Debugf(c.Request.Context(), "[WeCom] Parsed webhook message: msgid=%s msgtype=%s from=%s content=%q picurl=%q mediaid=%q",
+		msg.MsgID, msg.MsgType, msg.FromUserName, msg.Content, msg.PicUrl, msg.MediaId)
 
+	// Determine chat type
 	chatType := im.ChatTypeDirect
 	chatID := ""
-	content := msg.Content
-
-	// Check if this is a group message (has ChatId field in WeCom smart bot callback)
-	// In group chats, the content may contain @bot mention prefix that should be stripped
-	if msg.ChatID != "" {
+	isGroup := msg.ChatID != ""
+	if isGroup {
 		chatType = im.ChatTypeGroup
 		chatID = msg.ChatID
 	}
 
-	return &im.IncomingMessage{
-		Platform:  im.PlatformWeCom,
-		UserID:    msg.FromUserName,
-		UserName:  msg.FromUserName,
-		ChatID:    chatID,
-		ChatType:  chatType,
-		Content:   strings.TrimSpace(content),
-		MessageID: msg.MsgID,
-	}, nil
+	switch msg.MsgType {
+	case "text":
+		// Strip @mention in group chat (same issue as long connection mode).
+		// Webhook adapter has no persistent state, so use the standalone helper.
+		textContent := msg.Content
+		if isGroup {
+			textContent = stripAtMentionBasic(textContent)
+		}
+		return &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeText,
+			UserID:      msg.FromUserName,
+			UserName:    msg.FromUserName,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			Content:     strings.TrimSpace(textContent),
+			MessageID:   msg.MsgID,
+		}, nil
+
+	case "image":
+		// Image via webhook: has PicUrl (direct download) and MediaId
+		if msg.PicUrl == "" && msg.MediaId == "" {
+			return nil, nil
+		}
+		fileKey := msg.PicUrl
+		if fileKey == "" {
+			fileKey = msg.MediaId
+		}
+		return &im.IncomingMessage{
+			Platform:    im.PlatformWeCom,
+			MessageType: im.MessageTypeImage,
+			UserID:      msg.FromUserName,
+			UserName:    msg.FromUserName,
+			ChatID:      chatID,
+			ChatType:    chatType,
+			MessageID:   msg.MsgID,
+			FileKey:     fileKey,
+			FileName:    msg.MsgID + ".png",
+		}, nil
+
+	default:
+		logger.Infof(c.Request.Context(), "[WeCom] Ignoring unsupported message type: %s", msg.MsgType)
+		return nil, nil
+	}
 }
 
 // SendReply sends a reply message via WeCom API.
-// For simplicity, this uses the "应用消息" API to proactively send messages.
-// A production implementation would integrate with the streaming callback model.
+// For group chats, it tries the appchat API first to reply in the group,
+// then falls back to sending a direct message to the user.
 func (a *WebhookAdapter) SendReply(ctx context.Context, incoming *im.IncomingMessage, reply *im.ReplyMessage) error {
-	// Get access token
 	accessToken, err := a.getAccessToken(ctx)
 	if err != nil {
 		return fmt.Errorf("get access token: %w", err)
 	}
 
-	// Build message payload.
-	// Note: /cgi-bin/message/send only supports touser/toparty/totag — it does NOT
-	// support regular group chat IDs (chatid is only for appchat-created groups).
-	// So for both direct and group messages we reply to the user directly.
+	// For group chats, try sending to the group via appchat API first.
+	// This works for groups created via /cgi-bin/appchat/create.
+	if incoming.ChatType == im.ChatTypeGroup && incoming.ChatID != "" {
+		if err := a.sendToAppChat(ctx, accessToken, incoming.ChatID, reply); err == nil {
+			return nil
+		}
+		logger.Debugf(ctx, "[WeCom] appchat/send failed for chat=%s, falling back to touser: %v", incoming.ChatID, err)
+	}
+
+	// Fallback (or direct message): send to the user directly.
+	return a.sendToUser(ctx, accessToken, incoming.UserID, reply)
+}
+
+// sendToAppChat sends a message to a WeCom group chat via the appchat API.
+// Reference: https://developer.work.weixin.qq.com/document/path/90248
+func (a *WebhookAdapter) sendToAppChat(ctx context.Context, accessToken, chatID string, reply *im.ReplyMessage) error {
 	payload := map[string]interface{}{
-		"touser":  incoming.UserID,
+		"chatid":  chatID,
+		"msgtype": "markdown",
+		"markdown": map[string]string{
+			"content": reply.Content,
+		},
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	sendURL := fmt.Sprintf("%s/cgi-bin/appchat/send?access_token=%s", a.apiBaseURL, accessToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sendURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send appchat message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	if result.ErrCode != 0 {
+		return fmt.Errorf("appchat api error: code=%d msg=%s", result.ErrCode, result.ErrMsg)
+	}
+
+	return nil
+}
+
+// sendToUser sends a message directly to a user via the application message API.
+// Reference: https://developer.work.weixin.qq.com/document/path/90236
+func (a *WebhookAdapter) sendToUser(ctx context.Context, accessToken, userID string, reply *im.ReplyMessage) error {
+	payload := map[string]interface{}{
+		"touser":  userID,
 		"msgtype": "markdown",
 		"agentid": a.corpAgentID,
 		"markdown": map[string]string{
@@ -207,7 +350,7 @@ func (a *WebhookAdapter) SendReply(ctx context.Context, incoming *im.IncomingMes
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	sendURL := fmt.Sprintf("https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=%s", accessToken)
+	sendURL := fmt.Sprintf("%s/cgi-bin/message/send?access_token=%s", a.apiBaseURL, accessToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sendURL, bytes.NewReader(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
@@ -244,8 +387,8 @@ func (a *WebhookAdapter) getAccessToken(ctx context.Context) (string, error) {
 		return a.tokenCache, nil
 	}
 
-	tokenURL := fmt.Sprintf("https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=%s&corpsecret=%s",
-		a.corpID, a.agentSecret)
+	tokenURL := fmt.Sprintf("%s/cgi-bin/gettoken?corpid=%s&corpsecret=%s",
+		a.apiBaseURL, a.corpID, a.agentSecret)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
 	if err != nil {
@@ -357,14 +500,197 @@ type callbackRequestBody struct {
 }
 
 // wecomMessage is the decrypted WeCom message structure.
+// Supports text, image, voice, video, location, and link message types.
+// Reference: https://developer.work.weixin.qq.com/document/path/90375
 type wecomMessage struct {
 	XMLName      xml.Name `xml:"xml"`
 	ToUserName   string   `xml:"ToUserName"`
 	FromUserName string   `xml:"FromUserName"`
 	CreateTime   int64    `xml:"CreateTime"`
 	MsgType      string   `xml:"MsgType"`
-	Content      string   `xml:"Content"`
+	Content      string   `xml:"Content"`      // text
+	PicUrl       string   `xml:"PicUrl"`       // image: download URL
+	MediaId      string   `xml:"MediaId"`      // image/voice/video: media ID for download
+	Format       string   `xml:"Format"`       // voice: audio format (amr/speex)
+	ThumbMediaId string   `xml:"ThumbMediaId"` // video: thumbnail media ID
 	MsgID        string   `xml:"MsgId"`
 	AgentID      string   `xml:"AgentID"`
 	ChatID       string   `xml:"ChatId"`
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// File download support for WeCom webhook mode
+// ──────────────────────────────────────────────────────────────────────
+
+// DownloadFile downloads a file/image from WeCom.
+// For webhook mode, images come with MediaId (temporary media) which can be
+// downloaded via the GetMedia API, or PicUrl for direct download.
+func (a *WebhookAdapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io.ReadCloser, string, error) {
+	if msg.FileKey == "" {
+		return nil, "", fmt.Errorf("no file key (URL or media_id) in message")
+	}
+
+	fileName := msg.FileName
+	if fileName == "" {
+		fileName = msg.FileKey
+	}
+
+	// If FileKey looks like a URL, download directly
+	if strings.HasPrefix(msg.FileKey, "http://") || strings.HasPrefix(msg.FileKey, "https://") {
+		return downloadFromURL(ctx, msg.FileKey, fileName, a.extraAllowedHost)
+	}
+
+	// Otherwise treat as media_id, download via temporary media API
+	accessToken, err := a.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("get access token: %w", err)
+	}
+
+	apiURL := fmt.Sprintf("%s/cgi-bin/media/get?access_token=%s&media_id=%s",
+		a.apiBaseURL, accessToken, msg.FileKey)
+	return downloadFromURL(ctx, apiURL, fileName, a.extraAllowedHost)
+}
+
+// downloadFromURL performs a GET request and returns the response body.
+// It tries to resolve the real filename from HTTP response headers:
+//  1. Content-Disposition: attachment; filename="xxx.pdf"
+//  2. Content-Type → extension mapping (fallback for platforms like WeCom that
+//     don't provide the original filename in the callback JSON)
+func downloadFromURL(ctx context.Context, rawURL, fileName string, extraAllowedHost string) (io.ReadCloser, string, error) {
+	// SSRF protection: reject internal/private URLs unless on the WeCom API allowlist.
+	if !isAllowedIMAPIHost(rawURL, extraAllowedHost) {
+		if err := secutils.ValidateURLForSSRF(rawURL); err != nil {
+			return nil, "", fmt.Errorf("URL rejected for security reasons: %v", err)
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("download: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("download failed: status=%d", resp.StatusCode)
+	}
+
+	logger.Debugf(ctx, "[WeCom] Download response: status=%d content-type=%s content-disposition=%s",
+		resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Content-Disposition"))
+
+	// Try to extract filename from Content-Disposition header.
+	// Supports both standard filename and RFC 5987 filename* parameters.
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			// Prefer filename* (RFC 5987, already decoded by mime.ParseMediaType)
+			if fn := params["filename"]; fn != "" {
+				fileName = fn
+			}
+		} else {
+			// Fallback: manual extraction for malformed headers
+			if idx := strings.Index(cd, "filename="); idx >= 0 {
+				extracted := strings.Trim(cd[idx+len("filename="):], "\" ")
+				if extracted != "" {
+					fileName = extracted
+				}
+			}
+		}
+	}
+
+	// URL-decode the filename if it contains percent-encoded characters.
+	// Some servers (e.g. WeCom COS) return URL-encoded Chinese filenames.
+	if strings.Contains(fileName, "%") {
+		if decoded, err := url.QueryUnescape(fileName); err == nil && decoded != "" {
+			fileName = decoded
+		}
+	}
+
+	// Also try to extract a meaningful filename from the URL path itself,
+	// in case Content-Disposition is missing but the URL contains the real name.
+	if !strings.Contains(fileName, ".") {
+		if u, err := url.Parse(rawURL); err == nil {
+			base := path.Base(u.Path)
+			if base != "" && base != "." && base != "/" && strings.Contains(base, ".") {
+				// URL-decode the path component as well
+				if decoded, err := url.QueryUnescape(base); err == nil {
+					fileName = decoded
+				} else {
+					fileName = base
+				}
+			}
+		}
+	}
+
+	// If filename still has no extension, try to infer from Content-Type.
+	// This handles platforms (e.g. WeCom aibot) where the callback only provides
+	// a hash ID as the filename without any extension.
+	if !strings.Contains(fileName, ".") {
+		if ext := contentTypeToExt(resp.Header.Get("Content-Type")); ext != "" {
+			fileName = fileName + "." + ext
+		}
+	}
+
+	return resp.Body, fileName, nil
+}
+
+// allowedIMAPIHosts lists IM platform API hosts that are trusted for file downloads.
+// URLs pointing to these hosts bypass isSSRFSafeURL checks because the WeCom API
+// itself returns these URLs in callback payloads (e.g. temporary media links).
+var allowedIMAPIHosts = []string{
+	"qyapi.weixin.qq.com",
+	"api.weixin.qq.com",
+	"open.work.weixin.qq.com",
+	"novac2c.cdn.weixin.qq.com",
+	"ilinkai.weixin.qq.com",
+}
+
+// isAllowedIMAPIHost returns true if rawURL points to a known IM platform API host.
+// extraHost is an optional additional trusted hostname (e.g. from a private deployment).
+func isAllowedIMAPIHost(rawURL string, extraHost string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	hostname := strings.ToLower(u.Hostname())
+	if extraHost != "" && hostname == extraHost {
+		return true
+	}
+	for _, allowed := range allowedIMAPIHosts {
+		if hostname == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// contentTypeToExt maps common Content-Type values to file extensions.
+func contentTypeToExt(ct string) string {
+	// Normalize: take only the media type, ignore parameters like charset
+	if idx := strings.Index(ct, ";"); idx >= 0 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	ct = strings.ToLower(ct)
+
+	mapping := map[string]string{
+		"application/pdf":    "pdf",
+		"application/msword": "doc",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+		"application/vnd.ms-excel": "xls",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         "xlsx",
+		"application/vnd.ms-powerpoint":                                             "ppt",
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+		"text/plain":    "txt",
+		"text/markdown": "md",
+		"text/csv":      "csv",
+		"image/png":     "png",
+		"image/jpeg":    "jpg",
+		"image/gif":     "gif",
+		"image/webp":    "webp",
+	}
+
+	return mapping[ct]
 }

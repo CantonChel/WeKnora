@@ -91,14 +91,6 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 		}, fmt.Errorf("knowledge_ids is required")
 	}
 
-	// Validate max 10 documents
-	if len(knowledgeIDs) > 10 {
-		return &types.ToolResult{
-			Success: false,
-			Error:   "knowledge_ids must contain at least one valid knowledge ID",
-		}, fmt.Errorf("no valid knowledge IDs provided")
-	}
-
 	// Concurrently get info for each knowledge ID
 	type docInfo struct {
 		knowledge  *types.Knowledge
@@ -137,12 +129,14 @@ func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage)
 				return
 			}
 
-			// Use knowledge's actual tenant_id for chunk query (supports cross-tenant shared KB)
+			// Use knowledge's actual tenant_id for chunk query (supports cross-tenant shared KB).
+			// Keep chunk-type filter aligned with list_knowledge_chunks so the
+			// "chunk_count" reported here matches what that tool can page over.
 			_, total, err := t.chunkService.GetRepository().
 				ListPagedChunksByKnowledgeID(ctx, knowledge.TenantID, id, &types.Pagination{
 					Page:     1,
-					PageSize: 1000,
-				}, []types.ChunkType{"text"}, "", "", "", "", "")
+					PageSize: 1,
+				}, []types.ChunkType{types.ChunkTypeText, types.ChunkTypeFAQ}, "", "", "", "", "")
 			if err != nil {
 				mu.Lock()
 				results[id] = &docInfo{

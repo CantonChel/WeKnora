@@ -25,6 +25,23 @@ import (
 
 const MAX_ITERATIONS = 100 // Max iterations for agent execution
 
+// dedupStrings removes duplicate strings while preserving the first occurrence order.
+func dedupStrings(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
 // agentService implements agent-related business logic
 type agentService struct {
 	cfg                   *config.Config
@@ -40,6 +57,7 @@ type agentService struct {
 	chunkService          interfaces.ChunkService
 	duckdb                *sql.DB
 	webSearchStateService interfaces.WebSearchStateService
+	wikiPageService       interfaces.WikiPageService
 }
 
 // NewAgentService creates a new agent service
@@ -57,6 +75,7 @@ func NewAgentService(
 	webSearchService interfaces.WebSearchService,
 	duckdb *sql.DB,
 	webSearchStateService interfaces.WebSearchStateService,
+	wikiPageService interfaces.WikiPageService,
 ) interfaces.AgentService {
 	return &agentService{
 		cfg:                   cfg,
@@ -72,6 +91,7 @@ func NewAgentService(
 		webSearchService:      webSearchService,
 		duckdb:                duckdb,
 		webSearchStateService: webSearchStateService,
+		wikiPageService:       wikiPageService,
 	}
 }
 
@@ -87,122 +107,55 @@ func (s *agentService) CreateAgentEngine(
 ) (interfaces.AgentEngine, error) {
 	logger.Infof(ctx, "Creating agent engine with custom EventBus")
 
-	// Validate config
+	// 1. Validate config
 	if err := s.ValidateConfig(config); err != nil {
 		return nil, fmt.Errorf("invalid agent config: %w", err)
 	}
-
 	if chatModel == nil {
 		return nil, fmt.Errorf("chat model is nil after initialization")
 	}
 
-	// Note: rerankModel can be nil when no knowledge bases are configured
-	// The registerTools function will filter out knowledge-related tools in this case
-
-	// Create tool registry
+	// 2. Build tool registry
 	toolRegistry := tools.NewToolRegistry()
-
-	// Register tools
+	if config.MaxToolOutputChars > 0 {
+		toolRegistry.SetMaxToolOutputSize(config.MaxToolOutputChars)
+	}
 	if err := s.registerTools(ctx, toolRegistry, config, rerankModel, chatModel, sessionID); err != nil {
 		return nil, fmt.Errorf("failed to register tools: %w", err)
 	}
+	s.registerMCPTools(ctx, toolRegistry, config)
 
-	// Register MCP tools from enabled services for this tenant
-	tenantID := uint64(0)
-	if tid, ok := types.TenantIDFromContext(ctx); ok {
-		tenantID = tid
-	}
-	if tenantID > 0 && s.mcpServiceService != nil && s.mcpManager != nil {
-		// Check MCP selection mode from agent config
-		mcpMode := config.MCPSelectionMode
-		if mcpMode == "" {
-			mcpMode = "all" // Default to all enabled MCP services
-		}
+	// 3. Resolve knowledge base and selected document metadata
+	kbInfos, selectedDocs := s.resolveKBAndDocInfos(ctx, config)
 
-		// Skip MCP registration if mode is "none"
-		if mcpMode == "none" {
-			logger.Infof(ctx, "MCP services disabled by agent config (mode: none)")
-		} else {
-			var mcpServices []*types.MCPService
-			var err error
-
-			if mcpMode == "selected" && len(config.MCPServices) > 0 {
-				// Get only selected MCP services
-				mcpServices, err = s.mcpServiceService.ListMCPServicesByIDs(ctx, tenantID, config.MCPServices)
-				if err != nil {
-					logger.Warnf(ctx, "Failed to list selected MCP services: %v", err)
-				} else {
-					logger.Infof(ctx, "Using %d selected MCP services from agent config", len(mcpServices))
-				}
-			} else {
-				// Get all MCP services for this tenant
-				mcpServices, err = s.mcpServiceService.ListMCPServices(ctx, tenantID)
-				if err != nil {
-					logger.Warnf(ctx, "Failed to list MCP services: %v", err)
-				}
-			}
-
-			if err == nil && len(mcpServices) > 0 {
-				// Filter enabled services
-				enabledServices := make([]*types.MCPService, 0)
-				for _, svc := range mcpServices {
-					if svc != nil && svc.Enabled {
-						enabledServices = append(enabledServices, svc)
-					}
-				}
-
-				// Register MCP tools
-				if len(enabledServices) > 0 {
-					if err := tools.RegisterMCPTools(ctx, toolRegistry, enabledServices, s.mcpManager); err != nil {
-						logger.Warnf(ctx, "Failed to register MCP tools: %v", err)
-					} else {
-						logger.Infof(ctx, "Registered MCP tools from %d enabled services", len(enabledServices))
-					}
-				}
-			}
-		}
-	}
-
-	// Get knowledge base detailed information for prompt
-	kbInfos, err := s.getKnowledgeBaseInfos(ctx, config.KnowledgeBases)
-	if err != nil {
-		logger.Warnf(ctx, "Failed to get knowledge base details, using IDs only: %v", err)
-		// Create fallback info with IDs only
-		kbInfos = make([]*agent.KnowledgeBaseInfo, 0, len(config.KnowledgeBases))
-		for _, kbID := range config.KnowledgeBases {
-			kbInfos = append(kbInfos, &agent.KnowledgeBaseInfo{
-				ID:          kbID,
-				Name:        kbID, // Use ID as name when details unavailable
-				Description: "",
-				DocCount:    0,
-			})
-		}
-	}
-
-	// Get selected documents information (user @ mentioned documents)
-	selectedDocs, err := s.getSelectedDocumentInfos(ctx, config.KnowledgeIDs)
-	if err != nil {
-		logger.Warnf(ctx, "Failed to get selected document details: %v", err)
-		selectedDocs = []*agent.SelectedDocumentInfo{}
-	}
-
+	// 4. Resolve system prompt template
 	systemPromptTemplate := ""
-	if config.UseCustomSystemPrompt {
+	if config.UseCustomSystemPrompt || config.SystemPrompt != "" {
 		systemPromptTemplate = config.ResolveSystemPrompt(config.WebSearchEnabled)
 	}
 
-	// Create engine with provided EventBus and contextManager
+	// 5. Create engine
 	engine := agent.NewAgentEngine(
-		config,
-		chatModel,
-		toolRegistry,
-		eventBus,
-		kbInfos,
-		selectedDocs,
-		contextManager,
-		sessionID,
+		config, chatModel, toolRegistry, eventBus,
+		kbInfos, selectedDocs, contextManager, sessionID,
 		systemPromptTemplate,
 	)
+	engine.SetAppConfig(s.cfg)
+
+	// Set VLM image describer for MCP tool result image analysis.
+	// When an MCP tool returns images, the engine uses VLM to generate text descriptions
+	// and appends them to the tool result content (since Chat Completions API does not
+	// reliably support images in tool role messages across providers).
+	if config.VLMModelID != "" {
+		if vlmModel, err := s.modelService.GetVLMModel(ctx, config.VLMModelID); err == nil {
+			engine.SetImageDescriber(func(ctx context.Context, imgBytes []byte, prompt string) (string, error) {
+				return vlmModel.Predict(ctx, [][]byte{imgBytes}, prompt)
+			})
+			logger.Infof(ctx, "VLM image describer set for MCP tool result analysis (model: %s)", config.VLMModelID)
+		} else {
+			logger.Warnf(ctx, "Failed to load VLM model %s for MCP image fallback: %v", config.VLMModelID, err)
+		}
+	}
 
 	// Initialize skills manager if skills are enabled
 	if config.SkillsEnabled && len(config.SkillDirs) > 0 {
@@ -211,11 +164,96 @@ func (s *agentService) CreateAgentEngine(
 			logger.Warnf(ctx, "Failed to initialize skills manager: %v", err)
 		} else if skillsManager != nil {
 			engine.SetSkillsManager(skillsManager)
-			logger.Infof(ctx, "Skills manager initialized with %d skills", len(skillsManager.GetAllMetadata()))
+			logger.Infof(ctx, "Skills manager initialized with %d skills",
+				len(skillsManager.GetAllMetadata()))
 		}
 	}
 
 	return engine, nil
+}
+
+// registerMCPTools registers MCP tools from enabled services for this tenant.
+func (s *agentService) registerMCPTools(
+	ctx context.Context,
+	toolRegistry *tools.ToolRegistry,
+	config *types.AgentConfig,
+) {
+	tenantID := uint64(0)
+	if tid, ok := types.TenantIDFromContext(ctx); ok {
+		tenantID = tid
+	}
+	if tenantID == 0 || s.mcpServiceService == nil || s.mcpManager == nil {
+		return
+	}
+
+	mcpMode := config.MCPSelectionMode
+	if mcpMode == "" {
+		mcpMode = "all"
+	}
+	if mcpMode == "none" {
+		logger.Infof(ctx, "MCP services disabled by agent config (mode: none)")
+		return
+	}
+
+	var mcpServices []*types.MCPService
+	var err error
+
+	if mcpMode == "selected" && len(config.MCPServices) > 0 {
+		mcpServices, err = s.mcpServiceService.ListMCPServicesByIDs(ctx, tenantID, config.MCPServices)
+		if err != nil {
+			logger.Warnf(ctx, "Failed to list selected MCP services: %v", err)
+			return
+		}
+		logger.Infof(ctx, "Using %d selected MCP services from agent config", len(mcpServices))
+	} else {
+		mcpServices, err = s.mcpServiceService.ListMCPServices(ctx, tenantID)
+		if err != nil {
+			logger.Warnf(ctx, "Failed to list MCP services: %v", err)
+			return
+		}
+	}
+
+	enabledServices := make([]*types.MCPService, 0)
+	for _, svc := range mcpServices {
+		if svc != nil && svc.Enabled {
+			enabledServices = append(enabledServices, svc)
+		}
+	}
+	if len(enabledServices) > 0 {
+		if err := tools.RegisterMCPTools(ctx, toolRegistry, enabledServices, s.mcpManager); err != nil {
+			logger.Warnf(ctx, "Failed to register MCP tools: %v", err)
+		} else {
+			logger.Infof(ctx, "Registered MCP tools from %d enabled services", len(enabledServices))
+		}
+	}
+}
+
+// resolveKBAndDocInfos loads knowledge base metadata and selected document info for prompt.
+func (s *agentService) resolveKBAndDocInfos(
+	ctx context.Context,
+	config *types.AgentConfig,
+) ([]*agent.KnowledgeBaseInfo, []*agent.SelectedDocumentInfo) {
+	kbInfos, err := s.getKnowledgeBaseInfos(ctx, config.KnowledgeBases)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to get knowledge base details, using IDs only: %v", err)
+		kbInfos = make([]*agent.KnowledgeBaseInfo, 0, len(config.KnowledgeBases))
+		for _, kbID := range config.KnowledgeBases {
+			kbInfos = append(kbInfos, &agent.KnowledgeBaseInfo{
+				ID:          kbID,
+				Name:        kbID,
+				Description: "",
+				DocCount:    0,
+			})
+		}
+	}
+
+	selectedDocs, err := s.getSelectedDocumentInfos(ctx, config.KnowledgeIDs)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to get selected document details: %v", err)
+		selectedDocs = []*agent.SelectedDocumentInfo{}
+	}
+
+	return kbInfos, selectedDocs
 }
 
 // initializeSkillsManager creates and initializes the skills manager
@@ -302,7 +340,15 @@ func (s *agentService) registerTools(
 	chatModel chat.Chat,
 	sessionID string,
 ) error {
-	// Use config's allowed tools if specified, otherwise use defaults
+	// Source of truth policy:
+	//   - `config.AllowedTools` is the explicit, user-editable whitelist —
+	//     populated by the agent-type preset on create and freely editable
+	//     afterwards.
+	//   - We never silently *inject* tools the user didn't pick.
+	//   - We still *filter out* tools whose capability prerequisites are missing
+	//     (no KB in scope, no Wiki-capable KB, etc.) so the LLM can't call tools
+	//     that would error at runtime.
+	//   - Legacy agents without AllowedTools fall back to DefaultAllowedTools().
 	var allowedTools []string
 	if len(config.AllowedTools) > 0 {
 		allowedTools = make([]string, len(config.AllowedTools))
@@ -311,6 +357,32 @@ func (s *agentService) registerTools(
 	} else {
 		allowedTools = tools.DefaultAllowedTools()
 		logger.Infof(ctx, "Using default allowed tools: %v", allowedTools)
+	}
+
+	// ---- Capability detection from SearchTargets ----
+	var hasVectorKB, hasWikiKB bool
+	var wikiKBIDs []string
+	var wikiScopes []tools.WikiScope
+	for _, target := range config.SearchTargets {
+		kb, err := s.knowledgeBaseService.GetKnowledgeBaseByIDOnly(ctx, target.KnowledgeBaseID)
+		if err != nil {
+			continue
+		}
+		if kb.IsVectorEnabled() || kb.IsKeywordEnabled() {
+			hasVectorKB = true
+		}
+		if kb.IsWikiEnabled() {
+			hasWikiKB = true
+			wikiKBIDs = append(wikiKBIDs, kb.ID)
+			// When the user @mentioned specific documents, carry the document
+			// whitelist into the wiki scope so wiki_search / wiki_read_page
+			// only surface pages whose SourceRefs intersect the pinned docs.
+			scope := tools.WikiScope{KnowledgeBaseID: kb.ID}
+			if target.Type == types.SearchTargetTypeKnowledge && len(target.KnowledgeIDs) > 0 {
+				scope.KnowledgeIDs = append([]string(nil), target.KnowledgeIDs...)
+			}
+			wikiScopes = append(wikiScopes, scope)
+		}
 	}
 
 	// Filter out knowledge base tools if no knowledge bases or knowledge IDs are configured
@@ -326,6 +398,17 @@ func (s *agentService) registerTools(
 			tools.ToolDatabaseQuery:       true,
 			tools.ToolDataAnalysis:        true,
 			tools.ToolDataSchema:          true,
+			// Wiki tools also require at least one KB in scope.
+			tools.ToolWikiReadPage:      true,
+			tools.ToolWikiSearch:        true,
+			tools.ToolWikiReadSourceDoc: true,
+			tools.ToolWikiFlagIssue:     true,
+			tools.ToolWikiWritePage:     true,
+			tools.ToolWikiReplaceText:   true,
+			tools.ToolWikiRenamePage:    true,
+			tools.ToolWikiDeletePage:    true,
+			tools.ToolWikiReadIssue:     true,
+			tools.ToolWikiUpdateIssue:   true,
 		}
 
 		// If no knowledge and no web search, also disable todo_write (not useful for simple chat)
@@ -347,6 +430,70 @@ func (s *agentService) registerTools(
 		allowedTools = append(allowedTools, tools.ToolWebSearch)
 		allowedTools = append(allowedTools, tools.ToolWebFetch)
 	}
+
+	// Tool capability sets — used by the hard safety nets below to drop tools
+	// whose runtime prerequisite (a matching KB surface) is missing.
+	//
+	// NOTE: ragToolSet must stay in sync with frontend `knowledgeBaseTools`
+	// in AgentEditorModal.vue. These are *all* tools that retrieve/inspect
+	// content from RAG-style knowledge bases.
+	ragToolSet := map[string]bool{
+		tools.ToolKnowledgeSearch:     true,
+		tools.ToolGrepChunks:          true,
+		tools.ToolListKnowledgeChunks: true,
+		tools.ToolQueryKnowledgeGraph: true,
+		tools.ToolGetDocumentInfo:     true,
+		tools.ToolDatabaseQuery:       true,
+	}
+	allWikiToolSet := map[string]bool{
+		tools.ToolWikiReadPage:      true,
+		tools.ToolWikiSearch:        true,
+		tools.ToolWikiReadSourceDoc: true,
+		tools.ToolWikiFlagIssue:     true,
+		tools.ToolWikiWritePage:     true,
+		tools.ToolWikiReplaceText:   true,
+		tools.ToolWikiRenamePage:    true,
+		tools.ToolWikiDeletePage:    true,
+		tools.ToolWikiReadIssue:     true,
+		tools.ToolWikiUpdateIssue:   true,
+	}
+
+	// Hard safety nets: drop tools whose runtime prerequisite is missing.
+	// This guards against stale configs where e.g. the user ticked wiki tools
+	// earlier but later swapped in a non-wiki KB (or vice versa for RAG).
+	if !hasWikiKB {
+		filtered := make([]string, 0, len(allowedTools))
+		dropped := make([]string, 0)
+		for _, t := range allowedTools {
+			if allWikiToolSet[t] {
+				dropped = append(dropped, t)
+				continue
+			}
+			filtered = append(filtered, t)
+		}
+		allowedTools = filtered
+		if len(dropped) > 0 {
+			logger.Warnf(ctx, "Dropped wiki tools %v because no wiki-capable KB is in scope", dropped)
+		}
+	}
+	if !hasVectorKB {
+		filtered := make([]string, 0, len(allowedTools))
+		dropped := make([]string, 0)
+		for _, t := range allowedTools {
+			if ragToolSet[t] {
+				dropped = append(dropped, t)
+				continue
+			}
+			filtered = append(filtered, t)
+		}
+		allowedTools = filtered
+		if len(dropped) > 0 {
+			logger.Warnf(ctx, "Dropped RAG tools %v because no RAG-capable KB is in scope", dropped)
+		}
+	}
+
+	// Deduplicate while preserving original order.
+	allowedTools = dedupStrings(allowedTools)
 
 	logger.Infof(ctx, "Registering tools: %v, webSearchEnabled: %v", allowedTools, config.WebSearchEnabled)
 	allowedTools = append(allowedTools, tools.ToolFinalAnswer)
@@ -379,7 +526,7 @@ func (s *agentService) registerTools(
 		case tools.ToolGetDocumentInfo:
 			toolToRegister = tools.NewGetDocumentInfoTool(s.knowledgeService, s.chunkService, config.SearchTargets)
 		case tools.ToolDatabaseQuery:
-			toolToRegister = tools.NewDatabaseQueryTool(s.db)
+			toolToRegister = tools.NewDatabaseQueryTool(s.db, config.SearchTargets)
 		case tools.ToolWebSearch:
 			toolToRegister = tools.NewWebSearchTool(
 				s.webSearchService,
@@ -388,8 +535,9 @@ func (s *agentService) registerTools(
 				s.webSearchStateService,
 				sessionID,
 				config.WebSearchMaxResults,
+				config.WebSearchProviderID,
 			)
-			logger.Infof(ctx, "Registered web_search tool for session: %s, maxResults: %d", sessionID, config.WebSearchMaxResults)
+			logger.Infof(ctx, "Registered web_search tool for session: %s, maxResults: %d, providerID: %s", sessionID, config.WebSearchMaxResults, config.WebSearchProviderID)
 
 		case tools.ToolWebFetch:
 			toolToRegister = tools.NewWebFetchTool(chatModel)
@@ -406,6 +554,29 @@ func (s *agentService) registerTools(
 		case tools.ToolFinalAnswer:
 			toolToRegister = tools.NewFinalAnswerTool()
 			logger.Infof(ctx, "Registered final_answer tool")
+
+		// Wiki tools — only registered when wiki KBs are detected
+		case tools.ToolWikiReadPage:
+			toolToRegister = tools.NewWikiReadPageTool(s.wikiPageService, wikiScopes)
+		case tools.ToolWikiSearch:
+			toolToRegister = tools.NewWikiSearchTool(s.wikiPageService, wikiScopes)
+		case tools.ToolWikiReadSourceDoc:
+			toolToRegister = tools.NewWikiReadSourceDocTool(s.knowledgeService, s.chunkService)
+		case tools.ToolWikiFlagIssue:
+			toolToRegister = tools.NewWikiFlagIssueTool(s.wikiPageService, wikiKBIDs)
+		case tools.ToolWikiReadIssue:
+			toolToRegister = tools.NewWikiReadIssueTool(s.wikiPageService, wikiKBIDs)
+		case tools.ToolWikiUpdateIssue:
+			toolToRegister = tools.NewWikiUpdateIssueTool(s.wikiPageService, wikiKBIDs)
+		case tools.ToolWikiWritePage:
+			toolToRegister = tools.NewWikiWritePageTool(s.wikiPageService, wikiKBIDs, s.knowledgeService)
+		case tools.ToolWikiReplaceText:
+			toolToRegister = tools.NewWikiReplaceTextTool(s.wikiPageService, wikiKBIDs, s.knowledgeService)
+		case tools.ToolWikiRenamePage:
+			toolToRegister = tools.NewWikiRenamePageTool(s.wikiPageService, wikiKBIDs)
+		case tools.ToolWikiDeletePage:
+			toolToRegister = tools.NewWikiDeletePageTool(s.wikiPageService, wikiKBIDs)
+
 		default:
 			logger.Warnf(ctx, "Unknown tool: %s", toolName)
 		}
@@ -452,15 +623,20 @@ func (s *agentService) getKnowledgeBaseInfos(ctx context.Context, kbIDs []string
 		kb, err := s.knowledgeBaseService.GetKnowledgeBaseByID(ctx, kbID)
 		if err != nil {
 			logger.Warnf(ctx, "Failed to get knowledge base %s: %v", secutils.SanitizeForLog(kbID), err)
-			// Add fallback info
 			kbInfos = append(kbInfos, &agent.KnowledgeBaseInfo{
 				ID:          kbID,
 				Name:        kbID,
-				Type:        "document", // Default type
+				Type:        "document",
 				Description: "",
 				DocCount:    0,
 				RecentDocs:  []agent.RecentDocInfo{},
 			})
+			continue
+		}
+
+		// Skip hidden/system-managed knowledge bases (e.g., __chat_history__)
+		if kb.IsTemporary {
+			logger.Debugf(ctx, "Skipping temporary knowledge base %s (%s) from prompt", kb.ID, kb.Name)
 			continue
 		}
 
@@ -533,16 +709,39 @@ func (s *agentService) getKnowledgeBaseInfos(ctx context.Context, kbIDs []string
 			kbType = "document" // Default type
 		}
 		kbInfos = append(kbInfos, &agent.KnowledgeBaseInfo{
-			ID:          kb.ID,
-			Name:        kb.Name,
-			Type:        kbType,
-			Description: kb.Description,
-			DocCount:    docCount,
-			RecentDocs:  recentDocs,
+			ID:           kb.ID,
+			Name:         kb.Name,
+			Type:         kbType,
+			Description:  kb.Description,
+			DocCount:     docCount,
+			Capabilities: kbRetrievalCapabilities(kb),
+			RecentDocs:   recentDocs,
 		})
 	}
 
 	return kbInfos, nil
+}
+
+// kbRetrievalCapabilities reports which retrieval surfaces a KB exposes.
+// Surfaces are the static facts the hybrid agent prompt consults to pick its
+// retrieval strategy — the agent should NOT need to probe this via search.
+//
+// Returned values are a subset of {"wiki", "chunks"}:
+//   - "wiki"   → the KB has wiki ingestion enabled (wiki_search / wiki_read_page)
+//   - "chunks" → the KB has vector and/or keyword (BM25) indexing enabled
+//     (knowledge_search / grep_chunks)
+func kbRetrievalCapabilities(kb *types.KnowledgeBase) []string {
+	if kb == nil {
+		return nil
+	}
+	caps := make([]string, 0, 2)
+	if kb.IsWikiEnabled() {
+		caps = append(caps, "wiki")
+	}
+	if kb.IsVectorEnabled() || kb.IsKeywordEnabled() {
+		caps = append(caps, "chunks")
+	}
+	return caps
 }
 
 // getSelectedDocumentInfos retrieves detailed information for user-selected documents (via @ mention)

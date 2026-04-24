@@ -10,12 +10,13 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
-	chatpipline "github.com/Tencent/WeKnora/internal/application/service/chat_pipline"
+	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
@@ -91,11 +92,13 @@ func NewChunkExtractTask(
 		logger.Warn(ctx, "NEO4J is not enabled, skip chunk extract task")
 		return nil
 	}
-	payload, err := json.Marshal(types.ExtractChunkPayload{
+	taskPayload := types.ExtractChunkPayload{
 		TenantID: tenantID,
 		ChunkID:  chunkID,
 		ModelID:  modelID,
-	})
+	}
+	langfuse.InjectTracing(ctx, &taskPayload)
+	payload, err := json.Marshal(taskPayload)
 	if err != nil {
 		return err
 	}
@@ -118,12 +121,14 @@ func NewDataTableSummaryTask(
 	summaryModel string,
 	embeddingModel string,
 ) error {
-	payload, err := json.Marshal(DataTableSummaryPayload{
+	taskPayload := DataTableSummaryPayload{
 		TenantID:       tenantID,
 		KnowledgeID:    knowledgeID,
 		SummaryModel:   summaryModel,
 		EmbeddingModel: embeddingModel,
-	})
+	}
+	langfuse.InjectTracing(ctx, &taskPayload)
+	payload, err := json.Marshal(taskPayload)
 	if err != nil {
 		return err
 	}
@@ -155,7 +160,7 @@ func NewChunkExtractService(
 	chunkRepo interfaces.ChunkRepository,
 	graphEngine interfaces.RetrieveGraphRepository,
 ) interfaces.TaskHandler {
-	// generator := chatpipline.NewQAPromptGenerator(chatpipline.NewFormater(), config.ExtractManager.ExtractGraph)
+	// generator := chatpipeline.NewQAPromptGenerator(chatpipeline.NewFormater(), config.ExtractManager.ExtractGraph)
 	// ctx := context.Background()
 	// logger.Debugf(ctx, "chunk extract system prompt: %s", generator.System(ctx))
 	// logger.Debugf(ctx, "chunk extract user prompt: %s", generator.User(ctx, "demo"))
@@ -211,7 +216,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 			},
 		},
 	}
-	extractor := chatpipline.NewExtractor(chatModel, template)
+	extractor := chatpipeline.NewExtractor(chatModel, template)
 	graph, err := extractor.Extract(ctx, chunk.Content)
 	if err != nil {
 		return err
@@ -238,6 +243,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 
 // DataTableExtractPayload represents the table extract task payload
 type DataTableSummaryPayload struct {
+	types.TracingContext
 	TenantID       uint64 `json:"tenant_id"`
 	KnowledgeID    string `json:"knowledge_id"`
 	SummaryModel   string `json:"summary_model"`

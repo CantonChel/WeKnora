@@ -128,6 +128,46 @@ func TestAliyunModelDetection(t *testing.T) {
 	})
 }
 
+func TestMiniMaxProviderValidation(t *testing.T) {
+	p := &MiniMaxProvider{}
+
+	t.Run("valid config", func(t *testing.T) {
+		config := &Config{
+			APIKey:    "test-key",
+			ModelName: "MiniMax-M2.7",
+		}
+		err := p.ValidateConfig(config)
+		assert.NoError(t, err)
+	})
+
+	t.Run("missing API key", func(t *testing.T) {
+		config := &Config{
+			ModelName: "MiniMax-M2.7",
+		}
+		err := p.ValidateConfig(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "API key")
+	})
+
+	t.Run("missing model name", func(t *testing.T) {
+		config := &Config{
+			APIKey: "test-key",
+		}
+		err := p.ValidateConfig(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "model name")
+	})
+
+	t.Run("info", func(t *testing.T) {
+		info := p.Info()
+		assert.Equal(t, ProviderMiniMax, info.Name)
+		assert.Equal(t, "MiniMax", info.DisplayName)
+		assert.Contains(t, info.ModelTypes, types.ModelTypeKnowledgeQA)
+		assert.True(t, info.RequiresAuth)
+		assert.Contains(t, info.Description, "M2.7")
+	})
+}
+
 func TestZhipuProviderValidation(t *testing.T) {
 	p := &ZhipuProvider{}
 
@@ -168,5 +208,21 @@ func TestListByModelType(t *testing.T) {
 			}
 		}
 		assert.True(t, found, "Aliyun should support rerank")
+	})
+
+	t.Run("embedding models include openrouter", func(t *testing.T) {
+		providers := ListByModelType(types.ModelTypeEmbedding)
+		assert.NotEmpty(t, providers)
+
+		found := false
+		for _, p := range providers {
+			if p.Name == ProviderOpenRouter {
+				found = true
+				assert.Equal(t, OpenRouterBaseURL, p.GetDefaultURL(types.ModelTypeEmbedding))
+				break
+			}
+		}
+
+		assert.True(t, found, "OpenRouter should support embedding")
 	})
 }
