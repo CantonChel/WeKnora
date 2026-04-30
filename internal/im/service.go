@@ -3,15 +3,18 @@ package im
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/textproto"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -28,8 +31,6 @@ import (
 )
 
 const (
-	// qaTimeout is the maximum time to wait for the QA pipeline to complete.
-	qaTimeout = 120 * time.Second
 	// dedupTTL is how long processed message IDs are retained.
 	dedupTTL = 5 * time.Minute
 	// dedupCleanupInterval is how often the dedup map is cleaned.
@@ -51,6 +52,124 @@ var imCitationTagRe = regexp.MustCompile(`<(?:kb|web)\b[^>]*/?>`)
 // stripIMCitationTags removes <kb .../> and <web .../> inline citation tags from s.
 func stripIMCitationTags(s string) string {
 	return imCitationTagRe.ReplaceAllString(s, "")
+}
+
+// imageXMLBlockRe matches <image ...>...</image> blocks produced by
+// EnrichContentWithImageInfo in the RAG context pipeline. These blocks contain
+// metadata for the LLM and must be stripped before sending to IM platforms.
+var imageXMLBlockRe = regexp.MustCompile(`(?s)<image\b[^>]*>.*?</image>`)
+
+// imageOriginalRe extracts the original markdown image syntax from <image_original> tags.
+var imageOriginalRe = regexp.MustCompile(`<image_original>(.*?)</image_original>`)
+
+// stripImageXMLTags collapses <image> blocks back to plain markdown.
+// Extracts the original ![alt](url) from <image_original> when present,
+// otherwise drops the block entirely.
+func stripImageXMLTags(s string) string {
+	return imageXMLBlockRe.ReplaceAllStringFunc(s, func(block string) string {
+		if m := imageOriginalRe.FindStringSubmatch(block); len(m) > 1 {
+			return m[1]
+		}
+		return ""
+	})
+}
+
+// storageSchemeRe matches provider:// URLs used by file storage backends.
+var storageSchemeRe = regexp.MustCompile(`\b(local|minio|s3|cos|tos|oss)://[^\s)\]>"]+`)
+
+// rewriteStorageURLs replaces all provider:// URLs in content with HTTP URLs
+// obtained from fileService.GetFileURL. URLs that are already HTTP or cannot
+// be resolved are left unchanged.
+func rewriteStorageURLs(ctx context.Context, content string, fileSvc interfaces.FileService) string {
+	if fileSvc == nil {
+		return content
+	}
+	return storageSchemeRe.ReplaceAllStringFunc(content, func(match string) string {
+		httpURL, err := fileSvc.GetFileURL(ctx, match)
+		if err != nil || httpURL == match {
+			return match
+		}
+		return httpURL
+	})
+}
+
+// ── Streaming holdback helpers ──
+// During streaming, content is flushed in 300ms batches. A provider:// URL or
+// an XML tag may be split across two batches. These helpers detect incomplete
+// patterns at the end of a chunk so the caller can hold them back until the
+// next flush completes them.
+
+// incompleteURLSuffixRe matches a provider:// URL that reaches the end of the
+// string — it may continue in the next chunk.
+var incompleteURLSuffixRe = regexp.MustCompile(
+	`\b(?:local|minio|s3|cos|tos|oss)://[^\s)\]>"]*$`,
+)
+
+// findIncompleteStorageURL returns the byte offset of a potentially truncated
+// provider:// URL at the tail of s, or -1 if none.
+func findIncompleteStorageURL(s string) int {
+	loc := incompleteURLSuffixRe.FindStringIndex(s)
+	if loc == nil {
+		return -1
+	}
+	return loc[0]
+}
+
+// incompleteXMLTagRe matches the opening of an <image…>, <kb…>, or <web…> tag
+// that reaches the end of the string without a closing '>'.
+var incompleteXMLTagRe = regexp.MustCompile(
+	`<(?:image|image_original|image_caption|image_ocr|kb|web)[^>]*$`,
+)
+
+// findIncompleteXMLTag returns the byte offset of a potentially truncated XML
+// tag at the tail of s, or -1 if none.
+func findIncompleteXMLTag(s string) int {
+	loc := incompleteXMLTagRe.FindStringIndex(s)
+	if loc == nil {
+		return -1
+	}
+	return loc[0]
+}
+
+// holdbackCutoff returns the earliest incomplete-pattern offset at the tail of
+// chunk, or len(chunk) if the chunk is safe to flush entirely.
+func holdbackCutoff(chunk string) int {
+	cutoff := len(chunk)
+	if idx := findIncompleteStorageURL(chunk); idx >= 0 && idx < cutoff {
+		cutoff = idx
+	}
+	if idx := findIncompleteXMLTag(chunk); idx >= 0 && idx < cutoff {
+		cutoff = idx
+	}
+	return cutoff
+}
+
+// cleanIMContent applies all IM-specific content transformations:
+//  1. Collapse <image> XML blocks back to plain markdown
+//  2. Strip <kb/> and <web/> citation tags
+//  3. Rewrite provider:// URLs to HTTP URLs (if fileSvc is available)
+func cleanIMContent(ctx context.Context, content string, fileSvc interfaces.FileService) string {
+	content = stripImageXMLTags(content)
+	content = stripIMCitationTags(content)
+	content = rewriteStorageURLs(ctx, content, fileSvc)
+	return content
+}
+
+// buildTenantFileService creates a FileService for the given tenant's storage config.
+// Returns nil if the tenant has no storage config or if creation fails.
+func buildTenantFileService(tenant *types.Tenant) interfaces.FileService {
+	if tenant == nil {
+		return nil
+	}
+	baseDir := os.Getenv("LOCAL_STORAGE_BASE_DIR")
+	if baseDir == "" {
+		baseDir = "/data/files"
+	}
+	fileSvc, _, err := filesvc.NewFileServiceFromStorageConfig("", tenant.StorageEngineConfig, baseDir)
+	if err != nil {
+		return nil
+	}
+	return fileSvc
 }
 
 const (
@@ -646,7 +765,7 @@ func (s *Service) storeInflightMapping(ctx context.Context, userKey, sessionID, 
 		return
 	}
 	val := sessionID + ":" + messageID
-	if err := s.redis.Set(ctx, RedisKeyInflight+userKey, val, qaTimeout+30*time.Second).Err(); err != nil {
+	if err := s.redis.Set(ctx, RedisKeyInflight+userKey, val, 10*time.Minute).Err(); err != nil {
 		logger.Warnf(ctx, "[IM] Failed to store inflight mapping: %v", err)
 	}
 }
@@ -925,7 +1044,28 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 	// 4. Get the WeKnora session
 	session, err := s.sessionService.GetSession(sessionCtx, channelSession.SessionID)
 	if err != nil {
-		return fmt.Errorf("get session: %w", err)
+		// The underlying session may have been deleted from the UI while the
+		// ChannelSession mapping still exists (GORM soft-delete does not trigger
+		// SQL ON DELETE CASCADE). Recover by soft-deleting the stale mapping and
+		// re-creating a fresh session so the IM bot doesn't become permanently
+		// unresponsive. (fixes #1046)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			logger.Warnf(ctx, "[IM] Session %s not found (deleted?), recycling stale channel session %s",
+				channelSession.SessionID, channelSession.ID)
+			if delErr := s.db.Delete(&ChannelSession{}, "id = ?", channelSession.ID).Error; delErr != nil {
+				logger.Warnf(ctx, "[IM] Failed to delete stale channel session %s: %v", channelSession.ID, delErr)
+			}
+			channelSession, err = s.resolveSession(sessionCtx, msg, tenantID, agentID, channelID, channel.SessionMode)
+			if err != nil {
+				return fmt.Errorf("resolve session (retry): %w", err)
+			}
+			session, err = s.sessionService.GetSession(sessionCtx, channelSession.SessionID)
+			if err != nil {
+				return fmt.Errorf("get session (retry): %w", err)
+			}
+		} else {
+			return fmt.Errorf("get session: %w", err)
+		}
 	}
 
 	// 5. Enqueue the QA request into the bounded worker pool.
@@ -942,6 +1082,7 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		adapter:   adapter,
 		channel:   channel,
 		channelID: channelID,
+		fileSvc:   buildTenantFileService(tenant),
 		userKey:   userKey,
 	}
 
@@ -1013,7 +1154,7 @@ func (s *Service) executeQARequest(req *qaRequest) {
 	// If the adapter supports streaming and output is not "full", use streaming.
 	if !streamDisabled {
 		if streamer, ok := req.adapter.(StreamSender); ok {
-			if err := s.handleMessageStream(ctx, req.msg, req.session, req.agent, kbIDs, streamer, req.adapter, req.userKey); err != nil {
+			if err := s.handleMessageStream(ctx, req.msg, req.session, req.agent, kbIDs, streamer, req.adapter, req.userKey, req.fileSvc); err != nil {
 				span.SetStatus(codes.Error, err.Error())
 				logger.Errorf(ctx, "[IM] Stream QA failed: %v", err)
 			}
@@ -1030,7 +1171,7 @@ func (s *Service) executeQARequest(req *qaRequest) {
 	}
 
 	reply := &ReplyMessage{
-		Content: answer,
+		Content: cleanIMContent(ctx, answer, req.fileSvc),
 		IsFinal: true,
 	}
 	if err := req.adapter.SendReply(ctx, req.msg, reply); err != nil {
@@ -1195,12 +1336,12 @@ func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tena
 	}
 }
 
-// resolveUserSession finds or creates a ChannelSession keyed by (platform, user_id, chat_id, tenant_id).
+// resolveUserSession finds or creates a ChannelSession keyed by (platform, user_id, chat_id, tenant_id, agent_id).
 // This is the original session resolution strategy.
 func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, tenantID uint64, agentID string, imChannelID string) (*ChannelSession, error) {
 	var cs ChannelSession
-	result := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND deleted_at IS NULL",
-		string(msg.Platform), msg.UserID, msg.ChatID, tenantID).
+	result := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
+		string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID).
 		First(&cs)
 
 	if result.Error == nil {
@@ -1244,8 +1385,8 @@ func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, 
 			logger.Warnf(ctx, "[IM] Failed to clean up orphaned session %s: %v", createdSession.ID, delErr)
 		}
 		var existing ChannelSession
-		if findErr := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND deleted_at IS NULL",
-			string(msg.Platform), msg.UserID, msg.ChatID, tenantID).
+		if findErr := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
+			string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID).
 			First(&existing).Error; findErr != nil {
 			return nil, fmt.Errorf("create channel session: %w (lookup fallback: %v)", err, findErr)
 		}
@@ -1258,7 +1399,7 @@ func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, 
 	return &cs, nil
 }
 
-// resolveThreadSession finds or creates a ChannelSession keyed by (platform, chat_id, thread_id, tenant_id).
+// resolveThreadSession finds or creates a ChannelSession keyed by (platform, chat_id, thread_id, tenant_id, agent_id).
 // In thread mode, each message thread gets its own session. Multiple users in the
 // same thread share the same session. Top-level messages use their own ID as
 // ThreadID, creating a new session per top-level message.
@@ -1274,8 +1415,8 @@ func (s *Service) resolveThreadSession(ctx context.Context, msg *IncomingMessage
 
 	var cs ChannelSession
 	result := s.db.Where(
-		"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND deleted_at IS NULL",
-		string(msg.Platform), threadID, msg.ChatID, tenantID,
+		"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
+		string(msg.Platform), msg.ChatID, threadID, tenantID, agentID,
 	).First(&cs)
 
 	if result.Error == nil {
@@ -1322,8 +1463,8 @@ func (s *Service) resolveThreadSession(ctx context.Context, msg *IncomingMessage
 		}
 		var existing ChannelSession
 		if findErr := s.db.Where(
-			"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND deleted_at IS NULL",
-			string(msg.Platform), msg.ChatID, threadID, tenantID,
+			"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
+			string(msg.Platform), msg.ChatID, threadID, tenantID, agentID,
 		).First(&existing).Error; findErr != nil {
 			return nil, fmt.Errorf("create thread session: %w (lookup fallback: %v)", err, findErr)
 		}
@@ -1435,23 +1576,18 @@ func briefToolSummary(output string) string {
 // handleMessageStream runs the QA pipeline and streams answer chunks to the IM platform
 // in real-time via the StreamSender interface. Chunks are batched at streamFlushInterval
 // to avoid API rate-limiting.
-func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, streamer StreamSender, adapter Adapter, userKey string) error {
-	ctx, span := tracing.ContextWithSpan(ctx, "im.StreamQA")
-	defer span.End()
-	span.SetAttributes(
-		attribute.String("im.user_id", msg.UserID),
-		attribute.String("im.platform", string(msg.Platform)),
-	)
-
+func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, streamer StreamSender, adapter Adapter, userKey string, fileSvc interfaces.FileService) error {
 	// Start the stream on the IM platform (e.g., create Feishu streaming card)
 	streamID, err := streamer.StartStream(ctx, msg)
 	if err != nil {
 		logger.Warnf(ctx, "[IM] StartStream failed, falling back to non-streaming: %v", err)
-		return s.fallbackNonStream(ctx, msg, session, customAgent, kbIDs, adapter, userKey)
+		return s.fallbackNonStream(ctx, msg, session, customAgent, kbIDs, adapter, userKey, fileSvc)
 	}
 
 	// Prepare the QA pipeline
-	qaCtx, qaCancel := context.WithTimeout(ctx, qaTimeout)
+	// No total deadline: each agent round has its own LLMCallTimeout (default 120s).
+	// A hard pipeline deadline would kill multi-round agent reasoning prematurely.
+	qaCtx, qaCancel := context.WithCancel(ctx)
 	defer qaCancel()
 
 	eventBus := event.NewEventBus()
@@ -1662,18 +1798,35 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 		}
 	}()
 
-	// Flush loop: periodically send buffered content to the IM platform
+	// Flush loop: periodically send buffered content to the IM platform.
+	// A holdback mechanism prevents flushing incomplete provider:// URLs or
+	// XML tags that straddle a chunk boundary (see holdbackCutoff).
 	ticker := time.NewTicker(streamFlushInterval)
 	defer ticker.Stop()
 
-	flush := func() {
+	var holdback string // text held back from the previous flush
+
+	flush := func(final bool) {
 		bufMu.Lock()
-		chunk := buf.String()
+		chunk := holdback + buf.String()
 		buf.Reset()
 		bufMu.Unlock()
+		holdback = ""
+
+		if chunk == "" {
+			return
+		}
+
+		// On non-final flushes, check for incomplete patterns at the tail.
+		if !final {
+			if cut := holdbackCutoff(chunk); cut < len(chunk) {
+				holdback = chunk[cut:]
+				chunk = chunk[:cut]
+			}
+		}
 
 		if chunk != "" {
-			if err := streamer.SendStreamChunk(ctx, msg, streamID, stripIMCitationTags(chunk)); err != nil {
+			if err := streamer.SendStreamChunk(ctx, msg, streamID, cleanIMContent(ctx, chunk, fileSvc)); err != nil {
 				logger.Warnf(ctx, "[IM] SendStreamChunk failed: %v", err)
 			}
 		}
@@ -1683,7 +1836,7 @@ loop:
 	for {
 		select {
 		case <-ticker.C:
-			flush()
+			flush(false)
 		case <-done:
 			break loop
 		case <-qaCtx.Done():
@@ -1691,8 +1844,8 @@ loop:
 		}
 	}
 
-	// Final flush of any remaining content
-	flush()
+	// Final flush of any remaining content (including holdback).
+	flush(true)
 
 	// If no user-visible content was streamed (e.g., the entire response was
 	// in <think> blocks, or the QA pipeline errored), send a fallback message
@@ -1736,20 +1889,21 @@ loop:
 }
 
 // fallbackNonStream is used when streaming initialization fails.
-func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, adapter Adapter, userKey string) error {
+func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, adapter Adapter, userKey string, fileSvc interfaces.FileService) error {
 	answer, err := s.runQA(ctx, session, msg.Content, customAgent, kbIDs, userKey, msg.Quote)
 	if err != nil {
 		logger.Errorf(ctx, "[IM] QA fallback failed: %v", err)
 		answer = "抱歉，处理您的问题时出现了异常，请稍后再试。"
 	}
 
-	return adapter.SendReply(ctx, msg, &ReplyMessage{Content: answer, IsFinal: true})
+	return adapter.SendReply(ctx, msg, &ReplyMessage{Content: cleanIMContent(ctx, answer, fileSvc), IsFinal: true})
 }
 
 // runQA executes the WeKnora QA pipeline and returns the full answer text.
 func (s *Service) runQA(ctx context.Context, session *types.Session, query string, customAgent *types.CustomAgent, kbIDs []string, userKey string, quote *QuotedMessage) (string, error) {
-	// Add timeout to prevent indefinite blocking
-	ctx, cancel := context.WithTimeout(ctx, qaTimeout)
+	// Cancellable context (no hard deadline): each agent round has its own
+	// LLMCallTimeout. The context can still be cancelled by /stop.
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	eventBus := event.NewEventBus()
@@ -1855,18 +2009,18 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		}
 	}()
 
-	// Wait for completion or timeout
+	// Wait for completion or cancellation (e.g., /stop)
 	select {
 	case <-done:
 	case <-ctx.Done():
 		// Mark assistant message as completed to avoid dangling incomplete records
-		assistantMsg.Content = "抱歉，回答超时，请稍后再试。"
+		assistantMsg.Content = "抱歉，回答已被取消。"
 		assistantMsg.IsCompleted = true
 		// Use a fresh context since the original is cancelled
 		if updateErr := s.messageService.UpdateMessage(context.WithoutCancel(ctx), assistantMsg); updateErr != nil {
-			logger.Warnf(ctx, "[IM] Failed to update timed-out assistant message: %v", updateErr)
+			logger.Warnf(ctx, "[IM] Failed to update cancelled assistant message: %v", updateErr)
 		}
-		return "", fmt.Errorf("QA timed out after %v", qaTimeout)
+		return "", fmt.Errorf("QA cancelled: %w", ctx.Err())
 	}
 
 	answerMu.Lock()
@@ -1888,9 +2042,8 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		logger.Warnf(ctx, "[IM] Failed to update assistant message: %v", err)
 	}
 
-	// Strip citation tags before returning to the IM adapter — IM platforms cannot
-	// render <kb .../> / <web .../> and would display them as raw text.
-	return stripIMCitationTags(answer), nil
+	// Return raw answer — callers apply cleanIMContent with the appropriate FileService.
+	return answer, nil
 }
 
 // ── CRUD operations for IM channels ──

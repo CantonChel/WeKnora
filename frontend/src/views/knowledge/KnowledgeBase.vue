@@ -28,13 +28,17 @@ import {
   createKnowledgeFromURL,
   listKnowledgeBases,
   reparseKnowledge,
+  batchDeleteKnowledge,
 } from "@/api/knowledge-base/index";
 import FAQEntryManager from './components/FAQEntryManager.vue';
+import DocumentListView from './components/DocumentListView.vue';
+import DocumentBatchBar from './components/DocumentBatchBar.vue';
 import WikiBrowser from './wiki/WikiBrowser.vue';
 import { getWikiStats } from '@/api/wiki';
 import { listMoveTargets, moveKnowledge, getKnowledgeMoveProgress } from '@/api/knowledge-base';
 import { useI18n } from 'vue-i18n';
 import { formatStringDate, kbFileTypeVerification } from '@/utils';
+import { formatFileSize } from '@/utils/files';
 import { getParserEngines, type ParserEngineInfo } from '@/api/system';
 const route = useRoute();
 const { t } = useI18n();
@@ -269,6 +273,26 @@ const moveMode = ref<'reuse_vectors' | 'reparse'>('reuse_vectors');
 const moveSubmitting = ref(false);
 let movePollTimer: ReturnType<typeof setInterval> | null = null;
 
+// View mode (grid / list) — persisted per browser
+type DocViewMode = 'grid' | 'list';
+const VIEW_MODE_KEY = 'weknora.kb.docs.viewMode';
+const initViewMode = (): DocViewMode => {
+  try {
+    return localStorage.getItem(VIEW_MODE_KEY) === 'list' ? 'list' : 'grid';
+  } catch { return 'grid'; }
+};
+const viewMode = ref<DocViewMode>(initViewMode());
+watch(viewMode, (v) => {
+  try { localStorage.setItem(VIEW_MODE_KEY, v); } catch { /* ignore */ }
+});
+
+// Multi-select state — shared between grid and list views.
+// Vue 3.5 tracks Set#add/delete natively, so direct mutation is reactive.
+const selectedIds = ref<Set<string>>(new Set());
+let lastSelectedIndex = -1;
+const batchDeleteDialog = ref(false);
+const batchDeleting = ref(false);
+
 const selectedTagId = ref<string>('');
 const tagList = ref<any[]>([]);
 const tagLoading = ref(false);
@@ -358,16 +382,6 @@ const formatDocTime = (time?: string) => {
   return formatted.slice(2, 16) // "YY-MM-DD HH:mm"
 }
 
-// 格式化文件大小，用于气泡等展示
-const formatFileSize = (bytes?: number | string) => {
-  if (bytes == null || bytes === '') return ''
-  const n = typeof bytes === 'string' ? parseInt(bytes, 10) : bytes
-  if (Number.isNaN(n) || n <= 0) return ''
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`
-}
-
 const channelLabelMap: Record<string, string> = {
   web: 'knowledgeBase.channelWeb',
   api: 'knowledgeBase.channelApi',
@@ -399,9 +413,9 @@ const getKnowledgeType = (item: any) => {
   return '--';
 }
 
-const loadKnowledgeFiles = (kbIdValue: string) => {
-  if (!kbIdValue) return;
-  getKnowled(
+const loadKnowledgeFiles = (kbIdValue: string): Promise<void> => {
+  if (!kbIdValue) return Promise.resolve();
+  return getKnowled(
     {
       page: 1,
       page_size: pageSize,
@@ -1600,6 +1614,113 @@ const delCardConfirm = () => {
   });
 };
 
+const toggleSelectRow = (id: string, checked: boolean, shiftKey?: boolean) => {
+  const items = cardList.value || [];
+  const idx = items.findIndex((i: KnowledgeCard) => i.id === id);
+  if (shiftKey && lastSelectedIndex >= 0 && idx >= 0) {
+    const [s, e] = idx < lastSelectedIndex
+      ? [idx, lastSelectedIndex]
+      : [lastSelectedIndex, idx];
+    for (let i = s; i <= e; i++) {
+      if (checked) selectedIds.value.add(items[i].id);
+      else selectedIds.value.delete(items[i].id);
+    }
+  } else {
+    if (checked) selectedIds.value.add(id);
+    else selectedIds.value.delete(id);
+  }
+  lastSelectedIndex = idx;
+};
+
+const onCardGridCheckboxChange = (id: string, checked: boolean, ctx?: { e?: Event }) => {
+  const me = ctx?.e as MouseEvent | undefined;
+  toggleSelectRow(id, checked, !!me?.shiftKey);
+};
+
+const toggleSelectAll = (checked: boolean) => {
+  if (checked) {
+    for (const item of cardList.value || []) selectedIds.value.add(item.id);
+  } else {
+    for (const item of cardList.value || []) selectedIds.value.delete(item.id);
+  }
+};
+
+const clearSelection = () => {
+  selectedIds.value.clear();
+  lastSelectedIndex = -1;
+};
+
+const openBatchDeleteDialog = () => {
+  if (selectedIds.value.size === 0) return;
+  batchDeleteDialog.value = true;
+};
+
+const confirmBatchDelete = async () => {
+  if (batchDeleting.value || selectedIds.value.size === 0) return;
+  const ids = Array.from(selectedIds.value);
+  const deletedIdSet = new Set(ids);
+  batchDeleting.value = true;
+  try {
+    const res: any = await batchDeleteKnowledge(kbId.value, ids);
+    if (res?.success) {
+      MessagePlugin.success(t('knowledgeBase.batchDeleteSuccess', { count: ids.length }));
+      clearSelection();
+      batchDeleteDialog.value = false;
+      page = 1;
+      // 后端将批量删除放入异步队列，立刻拉列表仍可能包含待删项；短轮询直到列表与后端一致或超时
+      const maxPolls = 30;
+      const delayMs = 400;
+      for (let i = 0; i < maxPolls; i++) {
+        await loadKnowledgeFiles(kbId.value);
+        const stillPresent = (cardList.value || []).some((c: KnowledgeCard) => deletedIdSet.has(c.id));
+        if (!stillPresent) break;
+        await new Promise<void>((r) => setTimeout(r, delayMs));
+      }
+      loadTags(kbId.value);
+    } else {
+      MessagePlugin.error(res?.message || t('knowledgeBase.batchDeleteFailed'));
+    }
+  } catch (e: any) {
+    MessagePlugin.error(e?.message || t('knowledgeBase.batchDeleteFailed'));
+  } finally {
+    batchDeleting.value = false;
+  }
+};
+
+// Bridge list-view actions back to existing per-card handlers.
+const handleListAction = (
+  action: 'edit' | 'reparse' | 'move' | 'delete',
+  item: KnowledgeCard,
+) => {
+  const idx = (cardList.value || []).findIndex((i: KnowledgeCard) => i.id === item.id);
+  if (action === 'edit') return handleManualEdit(idx, item);
+  if (action === 'reparse') return handleKnowledgeReparse(idx, item);
+  if (action === 'move') return handleMoveKnowledge(item);
+  if (action === 'delete') return delCard(idx, item);
+};
+
+// Clear selection on filter/tag/kb change to avoid acting on hidden items.
+watch([selectedTagId, docSearchKeyword, selectedFileType, kbId], () => {
+  clearSelection();
+});
+
+// After cardList reloads: stable keys rely on correct indices for shift-range; clamp anchor index.
+watch(cardList, () => {
+  const items = cardList.value || [];
+  const n = items.length;
+  if (lastSelectedIndex >= n) {
+    lastSelectedIndex = n > 0 ? n - 1 : -1;
+  }
+  if (moreIndex.value >= n) {
+    moreIndex.value = -1;
+  }
+  if (selectedIds.value.size === 0) return;
+  const visible = new Set(items.map((i: KnowledgeCard) => i.id));
+  for (const id of selectedIds.value) {
+    if (!visible.has(id)) selectedIds.value.delete(id);
+  }
+}, { deep: false });
+
 // 处理知识库编辑成功后的回调
 const handleKBEditorSuccess = (kbIdValue: string) => {
   if (kbIdValue === kbId.value) {
@@ -1979,6 +2100,30 @@ async function createNewSession(value: string): Promise<void> {
                 class="doc-type-select"
                 clearable
               />
+              <div class="doc-view-toggle" role="group" :aria-label="$t('knowledgeBase.viewModeToggle')">
+                <t-tooltip :content="$t('knowledgeBase.viewModeGrid')" placement="top">
+                  <button
+                    type="button"
+                    class="doc-view-toggle-btn"
+                    :class="{ active: viewMode === 'grid' }"
+                    @click="viewMode = 'grid'"
+                    :aria-pressed="viewMode === 'grid'"
+                  >
+                    <t-icon name="view-module" size="16px" />
+                  </button>
+                </t-tooltip>
+                <t-tooltip :content="$t('knowledgeBase.viewModeList')" placement="top">
+                  <button
+                    type="button"
+                    class="doc-view-toggle-btn"
+                    :class="{ active: viewMode === 'list' }"
+                    @click="viewMode = 'list'"
+                    :aria-pressed="viewMode === 'list'"
+                  >
+                    <t-icon name="view-list" size="16px" />
+                  </button>
+                </t-tooltip>
+              </div>
               <div v-if="canEdit" class="doc-filter-actions">
                 <t-tooltip :content="$t('knowledgeBase.addDocument')" placement="top">
                   <t-dropdown
@@ -2014,13 +2159,14 @@ async function createNewSession(value: string): Promise<void> {
                   </div>
                 </div>
               </div>
-              <template v-else-if="cardList.length">
+              <template v-else-if="cardList.length && viewMode === 'grid'">
                 <div class="doc-card-list doc-card-list-animated">
                   <!-- 现有文档卡片 -->
                   <div
                     class="knowledge-card"
+                    :class="{ 'is-selected': selectedIds.has(item.id), 'has-selection': selectedIds.size > 0 }"
                     v-for="(item, index) in cardList"
-                    :key="index"
+                    :key="item.id"
                     @click="openCardDetails(item)"
                     @mouseenter="onCardMouseEnter($event, item)"
                     @mousemove="onCardMouseMove($event)"
@@ -2028,6 +2174,20 @@ async function createNewSession(value: string): Promise<void> {
                   >
                     <div class="card-content">
                       <div class="card-content-nav">
+                        <div
+                          v-if="canEdit"
+                          class="card-nav-check"
+                          :class="{ active: selectedIds.has(item.id) }"
+                          @click.stop
+                        >
+                          <t-checkbox
+                            class="card-select-checkbox"
+                            size="small"
+                            :checked="selectedIds.has(item.id)"
+                            :title="item.file_name"
+                            @change="(checked, ctx) => onCardGridCheckboxChange(item.id, checked, ctx)"
+                          />
+                        </div>
                         <span class="card-content-title" :title="item.file_name">{{ item.file_name }}</span>
                         <t-popup
                           v-if="canEdit"
@@ -2234,11 +2394,31 @@ async function createNewSession(value: string): Promise<void> {
                   </div>
                 </Teleport>
               </template>
+              <template v-else-if="cardList.length && viewMode === 'list'">
+                <DocumentListView
+                  :items="cardList"
+                  :selected-ids="selectedIds"
+                  :tag-list="tagList"
+                  :can-edit="canEdit"
+                  @open="(item: any) => openCardDetails(item)"
+                  @toggle-row="toggleSelectRow"
+                  @toggle-all="toggleSelectAll"
+                  @action="(action: any, item: any) => handleListAction(action, item)"
+                />
+              </template>
               <template v-else-if="!docListLoading">
                 <div class="doc-empty-state">
                   <EmptyKnowledge />
                 </div>
               </template>
+            </div>
+            <div class="doc-batch-bar-anchor" v-show="selectedIds.size > 0">
+              <DocumentBatchBar
+                :count="selectedIds.size"
+                :loading="batchDeleting"
+                @clear="clearSelection"
+                @delete="openBatchDeleteDialog"
+              />
             </div>
           </div>
           <t-dialog
@@ -2260,6 +2440,41 @@ async function createNewSession(value: string): Promise<void> {
                 <span class="circle-btn-txt" @click="delDialog = false">{{ t('common.cancel') }}</span>
                 <span class="circle-btn-txt confirm" @click="delCardConfirm">
                   {{ t('knowledgeBase.confirmDelete') }}
+                </span>
+              </div>
+            </div>
+          </t-dialog>
+
+          <!-- 批量删除确认弹窗 -->
+          <t-dialog
+            v-model:visible="batchDeleteDialog"
+            dialogClassName="del-knowledge"
+            :closeBtn="false"
+            :cancelBtn="null"
+            :confirmBtn="null"
+          >
+            <div class="circle-wrap">
+              <div class="header">
+                <img class="circle-img" src="@/assets/img/circle.png" alt="" />
+                <span class="circle-title">{{ t('knowledgeBase.batchDeleteConfirmation') }}</span>
+              </div>
+              <span class="del-circle-txt">
+                {{ t('knowledgeBase.confirmBatchDeleteDocument', { count: selectedIds.size }) }}
+              </span>
+              <div class="circle-btn">
+                <span
+                  class="circle-btn-txt"
+                  :class="{ disabled: batchDeleting }"
+                  @click="batchDeleting ? null : (batchDeleteDialog = false)"
+                >
+                  {{ t('common.cancel') }}
+                </span>
+                <span
+                  class="circle-btn-txt confirm"
+                  :class="{ disabled: batchDeleting }"
+                  @click="confirmBatchDelete"
+                >
+                  {{ batchDeleting ? '...' : t('knowledgeBase.confirmDelete') }}
                 </span>
               </div>
             </div>
@@ -2354,7 +2569,7 @@ async function createNewSession(value: string): Promise<void> {
   flex: 1;
   width: 100%;
   min-width: 0;
-  padding: 24px 32px 32px;
+  padding: 24px 32px 0px;
   box-sizing: border-box;
 }
 
@@ -2809,6 +3024,7 @@ async function createNewSession(value: string): Promise<void> {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative; /* 作为批量工具栏悬浮的定位上下文 */
 }
 
 .doc-filter-bar {
@@ -2826,6 +3042,38 @@ async function createNewSession(value: string): Promise<void> {
   .doc-type-select {
     width: 140px;
     flex-shrink: 0;
+  }
+
+  .doc-view-toggle {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    padding: 2px;
+    background: var(--td-bg-color-secondarycontainer);
+    border-radius: 6px;
+    gap: 0;
+
+    .doc-view-toggle-btn {
+      width: 28px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      background: transparent;
+      border-radius: 4px;
+      color: var(--td-text-color-secondary, #888);
+      cursor: pointer;
+      transition: background-color 0.12s ease, color 0.12s ease;
+
+      &:hover { color: var(--td-text-color-primary, #232323); }
+
+      &.active {
+        background: var(--td-bg-color-container, #fff);
+        color: var(--td-brand-color, #0052d9);
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+      }
+    }
   }
 
   .doc-filter-actions {
@@ -2887,6 +3135,23 @@ async function createNewSession(value: string): Promise<void> {
     align-items: center;
     justify-content: center;
     overflow-y: hidden;
+  }
+}
+
+/* 批量条悬浮在滚动区底部，不挤占列表高度 */
+.doc-batch-bar-anchor {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 12px;
+  z-index: 6;
+  display: flex;
+  justify-content: center;
+  padding: 0 16px;
+  pointer-events: none;
+
+  & > * {
+    pointer-events: auto;
   }
 }
 
@@ -3166,6 +3431,7 @@ async function createNewSession(value: string): Promise<void> {
 
 .faq-manager-wrapper {
   flex: 1;
+  min-height: 0;
   padding: 24px 32px;
   overflow-y: auto;
   margin: 0 16px 0 4px;
@@ -3220,7 +3486,7 @@ async function createNewSession(value: string): Promise<void> {
   box-sizing: border-box;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
-  gap: 14px;
+  gap: 16px;
   align-content: flex-start;
   width: 100%;
 
@@ -3231,14 +3497,24 @@ async function createNewSession(value: string): Promise<void> {
 
 .knowledge-card-skeleton {
   cursor: default;
-  .card-content { padding: 15px 17px 13px; }
-  .card-content-nav { margin-bottom: 14px; }
+
+  .card-content {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 12px 16px 8px;
+  }
+
+  .card-content-nav {
+    margin-bottom: 8px;
+  }
+
   .card-bottom {
-    position: absolute;
-    bottom: 0;
-    left: 0;
+    flex-shrink: 0;
+    margin-top: auto;
     width: 100%;
-    padding: 0 17px;
+    padding: 0 16px;
     box-sizing: border-box;
     height: 34px;
     display: flex;
@@ -3326,6 +3602,11 @@ async function createNewSession(value: string): Promise<void> {
     font-weight: 400;
     line-height: 22px;
     cursor: pointer;
+
+    &.disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
   }
 
   .confirm {
@@ -3520,6 +3801,7 @@ async function createNewSession(value: string): Promise<void> {
   align-items: center;
   gap: 8px;
   padding: 6px 0;
+  flex-shrink: 0;
 }
 
 .card-draft-tip {
@@ -3529,22 +3811,82 @@ async function createNewSession(value: string): Promise<void> {
 
 .knowledge-card {
   min-width: 248px;
-  border: 1px solid var(--td-component-stroke);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid color-mix(in srgb, var(--td-component-stroke) 82%, var(--td-bg-color-secondarycontainer));
   height: 148px;
   border-radius: 9px;
   overflow: hidden;
   box-sizing: border-box;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.035);
   background: var(--td-bg-color-container);
   position: relative;
   cursor: pointer;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+
+  /* 默认折叠不占位，悬停/多选/已选时展开，避免非选择态左侧错位 */
+  .card-nav-check {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 0;
+    height: 29px;
+    margin-right: 0;
+    opacity: 0;
+    overflow: hidden;
+    transition: width 0.2s ease, margin-right 0.2s ease, opacity 0.2s ease;
+    cursor: pointer;
+
+    &.active {
+      width: 22px;
+      margin-right: 8px;
+      opacity: 1;
+    }
+
+    .card-select-checkbox {
+      margin: 0;
+      line-height: 0;
+
+      :deep(.t-checkbox) {
+        align-items: center;
+      }
+
+      :deep(.t-checkbox__label) {
+        display: none !important;
+        width: 0 !important;
+        min-width: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+      }
+
+      :deep(.t-checkbox__input) {
+        margin: 0;
+      }
+
+      :deep(.t-checkbox__input-wrapper) {
+        margin: 0;
+      }
+    }
+  }
+
+  &:hover .card-nav-check,
+  &.has-selection .card-nav-check {
+    width: 22px;
+    margin-right: 8px;
+    opacity: 1;
+  }
 
   .card-content {
-    padding: 15px 17px 13px;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 12px 16px 8px;
   }
 
   .card-analyze {
+    flex-shrink: 0;
     height: 52px;
     display: flex;
   }
@@ -3568,11 +3910,11 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .card-content-nav {
+    flex-shrink: 0;
     display: flex;
-    justify-content: space-between;
     align-items: flex-start;
-    margin-bottom: 11px;
-    gap: 8px;
+    gap: 0;
+    margin-bottom: 8px;
   }
 
   .card-content-title {
@@ -3589,6 +3931,7 @@ async function createNewSession(value: string): Promise<void> {
     font-size: 15px;
     font-weight: 600;
     letter-spacing: 0.01em;
+    margin-right: 8px;
   }
 
   .more-wrap {
@@ -3616,6 +3959,8 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .card-content-txt {
+    flex: 1;
+    min-height: 0;
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
@@ -3629,9 +3974,9 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .card-bottom {
-    position: absolute;
-    bottom: 0;
-    padding: 0 17px;
+    flex-shrink: 0;
+    margin-top: auto;
+    padding: 0 16px;
     box-sizing: border-box;
     height: 34px;
     width: 100%;
@@ -3650,19 +3995,19 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .card-type {
-    color: var(--td-text-color-secondary);
+    color: var(--td-text-color-placeholder);
     font-family: "PingFang SC";
     font-size: 11px;
     font-weight: 500;
-    padding: 3px 8px;
-    background: var(--td-bg-color-secondarycontainer);
-    border-radius: 4px;
+    padding: 0;
+    background: transparent;
+    letter-spacing: 0.02em;
   }
 }
 
 .knowledge-card:hover {
-  border-color: var(--td-brand-color);
-  box-shadow: 0 2px 8px rgba(7, 192, 95, 0.12);
+  border-color: color-mix(in srgb, var(--td-component-stroke) 55%, var(--td-brand-color));
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.07);
 }
 
 /* 悬停知识卡片时跟随鼠标的详情气泡 */

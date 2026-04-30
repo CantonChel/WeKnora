@@ -6,7 +6,7 @@ package container
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -76,7 +76,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	slackpkg "github.com/slack-go/slack"
 	"github.com/weaviate/weaviate-go-client/v5/weaviate"
 	"github.com/weaviate/weaviate-go-client/v5/weaviate/auth"
 	wgrpc "github.com/weaviate/weaviate-go-client/v5/weaviate/grpc"
@@ -738,7 +737,8 @@ func initFileService(cfg *config.Config) (interfaces.FileService, error) {
 		if baseDir == "" {
 			baseDir = "/data/files"
 		}
-		return file.NewLocalFileService(baseDir), nil
+		externalURL := strings.TrimSpace(os.Getenv("APP_EXTERNAL_URL"))
+		return file.NewLocalFileService(baseDir, externalURL), nil
 	case "dummy":
 		return file.NewDummyFileService(), nil
 	default:
@@ -1132,16 +1132,17 @@ func NewDuckDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 
-	// Try to install and load spatial extension
-	installSQL := "INSTALL spatial;"
-	if _, err := sqlDB.ExecContext(context.Background(), installSQL); err != nil {
-		logger.Warnf(context.Background(), "[DuckDB] Failed to install spatial extension: %v", err)
-	}
-
-	// Try to load spatial extension
-	loadSQL := "LOAD spatial;"
-	if _, err := sqlDB.ExecContext(context.Background(), loadSQL); err != nil {
-		logger.Warnf(context.Background(), "[DuckDB] Failed to load spatial extension: %v", err)
+	// Try to install and load required extensions.
+	//   - spatial: used for st_read_meta() to enumerate layer (sheet) names from .xlsx/.xls
+	//   - excel:   used for read_xlsx() which gives proper type inference per sheet
+	bgCtx := context.Background()
+	for _, ext := range []string{"spatial", "excel"} {
+		if _, err := sqlDB.ExecContext(bgCtx, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
+			logger.Warnf(bgCtx, "[DuckDB] Failed to install %s extension: %v", ext, err)
+		}
+		if _, err := sqlDB.ExecContext(bgCtx, fmt.Sprintf("LOAD %s;", ext)); err != nil {
+			logger.Warnf(bgCtx, "[DuckDB] Failed to load %s extension: %v", ext, err)
+		}
 	}
 
 	return sqlDB, nil
@@ -1160,359 +1161,48 @@ func registerWebSearchProviders(registry *infra_web_search.Registry) {
 }
 
 // registerIMAdapterFactories registers adapter factories for each IM platform
-// and loads enabled channels from the database.
+// and loads enabled channels from the database. Each platform's factory lives
+// in its own subpackage to keep this file focused on wiring.
 func registerIMAdapterFactories(imService *imPkg.Service) {
-	ctx := context.Background()
-
-	// Register WeCom adapter factory
-	imService.RegisterAdapterFactory("wecom", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
-		creds, err := parseCredentials(channel.Credentials)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse wecom credentials: %w", err)
-		}
-
-		mode := channel.Mode
-		if mode == "" {
-			mode = "websocket"
-		}
-
-		switch mode {
-		case "webhook":
-			corpAgentID := 0
-			if v, ok := creds["corp_agent_id"]; ok {
-				switch val := v.(type) {
-				case float64:
-					corpAgentID = int(val)
-				case int:
-					corpAgentID = val
-				}
-			}
-			adapter, err := wecom.NewWebhookAdapter(
-				getString(creds, "corp_id"),
-				getString(creds, "agent_secret"),
-				getString(creds, "token"),
-				getString(creds, "encoding_aes_key"),
-				corpAgentID,
-				getString(creds, "api_base_url"),
-			)
-			if err != nil {
-				return nil, nil, err
-			}
-			return adapter, nil, nil
-
-		case "websocket":
-			client, err := wecom.NewLongConnClient(
-				getString(creds, "bot_id"),
-				getString(creds, "bot_secret"),
-				getString(creds, "ws_endpoint"),
-				getString(creds, "bot_name"),
-				msgHandler,
-			)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			wsCtx, wsCancel := context.WithCancel(context.Background())
-			go func() {
-				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
-					logger.Errorf(context.Background(), "[IM] WeCom long connection stopped for channel %s: %v", channel.ID, err)
-				}
-			}()
-
-			adapter := wecom.NewWSAdapter(client)
-			return adapter, wsCancel, nil
-
-		default:
-			return nil, nil, fmt.Errorf("unknown WeCom mode: %s", mode)
-		}
-	})
-
-	// Register Feishu adapter factory
-	imService.RegisterAdapterFactory("feishu", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
-		creds, err := parseCredentials(channel.Credentials)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse feishu credentials: %w", err)
-		}
-
-		appID := getString(creds, "app_id")
-		appSecret := getString(creds, "app_secret")
-		verificationToken := getString(creds, "verification_token")
-		encryptKey := getString(creds, "encrypt_key")
-
-		// Always create the HTTP adapter (needed for SendReply in both modes)
-		adapter := feishu.NewAdapter(appID, appSecret, verificationToken, encryptKey)
-
-		mode := channel.Mode
-		if mode == "" {
-			mode = "websocket"
-		}
-
-		switch mode {
-		case "webhook":
-			return adapter, nil, nil
-
-		case "websocket":
-			client := feishu.NewLongConnClient(appID, appSecret, msgHandler)
-
-			wsCtx, wsCancel := context.WithCancel(context.Background())
-			go func() {
-				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
-					logger.Errorf(context.Background(), "[IM] Feishu long connection stopped for channel %s: %v", channel.ID, err)
-				}
-			}()
-
-			return adapter, wsCancel, nil
-
-		default:
-			return nil, nil, fmt.Errorf("unknown Feishu mode: %s", mode)
-		}
-	})
-
-	// Register Slack adapter factory
-	imService.RegisterAdapterFactory("slack", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
-		creds, err := parseCredentials(channel.Credentials)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse slack credentials: %w", err)
-		}
-
-		mode := channel.Mode
-		if mode == "" {
-			mode = "websocket"
-		}
-
-		switch mode {
-		case "webhook":
-			api := slackpkg.New(getString(creds, "bot_token"))
-			adapter := slack.NewWebhookAdapter(api, getString(creds, "signing_secret"))
-			return adapter, func() {}, nil
-
-		case "websocket":
-			client := slack.NewLongConnClient(
-				getString(creds, "app_token"),
-				getString(creds, "bot_token"),
-				msgHandler,
-			)
-
-			adapter := slack.NewAdapter(client, client.GetAPI())
-
-			wsCtx, wsCancel := context.WithCancel(context.Background())
-			go func() {
-				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
-					logger.Errorf(context.Background(), "[IM] Slack long connection stopped for channel %s: %v", channel.ID, err)
-				}
-			}()
-
-			return adapter, wsCancel, nil
-
-		default:
-			return nil, nil, fmt.Errorf("unsupported slack mode: %s", mode)
-		}
-	})
-
-	// Register Telegram adapter factory
-	imService.RegisterAdapterFactory("telegram", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
-		creds, err := parseCredentials(channel.Credentials)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse telegram credentials: %w", err)
-		}
-
-		botToken := getString(creds, "bot_token")
-
-		mode := channel.Mode
-		if mode == "" {
-			mode = "websocket"
-		}
-
-		switch mode {
-		case "webhook":
-			secretToken := getString(creds, "secret_token")
-			adapter := telegram.NewWebhookAdapter(botToken, secretToken)
-			return adapter, nil, nil
-
-		case "websocket":
-			client := telegram.NewLongConnClient(botToken, msgHandler)
-
-			wsCtx, wsCancel := context.WithCancel(context.Background())
-			go func() {
-				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
-					logger.Errorf(context.Background(), "[IM] Telegram long polling stopped for channel %s: %v", channel.ID, err)
-				}
-			}()
-
-			adapter := telegram.NewAdapter(client, botToken)
-			return adapter, wsCancel, nil
-
-		default:
-			return nil, nil, fmt.Errorf("unsupported telegram mode: %s", mode)
-		}
-	})
-
-	// Register DingTalk adapter factory
-	imService.RegisterAdapterFactory("dingtalk", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
-		creds, err := parseCredentials(channel.Credentials)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse dingtalk credentials: %w", err)
-		}
-
-		clientID := getString(creds, "client_id")
-		clientSecret := getString(creds, "client_secret")
-		cardTemplateID := getString(creds, "card_template_id")
-
-		mode := channel.Mode
-		if mode == "" {
-			mode = "websocket"
-		}
-
-		switch mode {
-		case "webhook":
-			adapter := dingtalk.NewWebhookAdapter(clientID, clientSecret, cardTemplateID)
-			return adapter, nil, nil
-
-		case "websocket":
-			client := dingtalk.NewLongConnClient(clientID, clientSecret, msgHandler)
-
-			wsCtx, wsCancel := context.WithCancel(context.Background())
-			go func() {
-				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
-					logger.Errorf(context.Background(), "[IM] DingTalk stream stopped for channel %s: %v", channel.ID, err)
-				}
-			}()
-
-			adapter := dingtalk.NewAdapter(client, clientID, clientSecret, cardTemplateID)
-			return adapter, wsCancel, nil
-
-		default:
-			return nil, nil, fmt.Errorf("unsupported dingtalk mode: %s", mode)
-		}
-	})
-
-	// Register Mattermost adapter factory (outgoing webhook + REST API).
-	imService.RegisterAdapterFactory("mattermost", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
-		creds, err := parseCredentials(channel.Credentials)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse mattermost credentials: %w", err)
-		}
-
-		mode := channel.Mode
-		if mode == "" {
-			mode = "webhook"
-		}
-		if mode != "webhook" {
-			return nil, nil, fmt.Errorf("unsupported mattermost mode: %s (only webhook is supported)", mode)
-		}
-
-		siteURL := getString(creds, "site_url")
-		botToken := getString(creds, "bot_token")
-		outgoingToken := getString(creds, "outgoing_token")
-		botUserID := getString(creds, "bot_user_id")
-
-		if outgoingToken == "" {
-			return nil, nil, fmt.Errorf("mattermost outgoing_token is required")
-		}
-
-		client, err := mattermost.NewClient(siteURL, botToken)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		postReplyToMain := credentialBool(creds, "post_to_main")
-		adapter := mattermost.NewAdapter(client, outgoingToken, botUserID, postReplyToMain)
-		return adapter, func() {}, nil
-	})
-	// Register WeChat adapter factory
-	imService.RegisterAdapterFactory("wechat", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
-		creds, err := parseCredentials(channel.Credentials)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse wechat credentials: %w", err)
-		}
-
-		botToken := getString(creds, "bot_token")
-		ilinkBotID := getString(creds, "ilink_bot_id")
-
-		if botToken == "" || ilinkBotID == "" {
-			return nil, nil, fmt.Errorf("wechat credentials require bot_token and ilink_bot_id")
-		}
-
-		adapter := wechat.NewAdapter(botToken, ilinkBotID)
-		client := wechat.NewLongPollClient(botToken, ilinkBotID, msgHandler)
-
-		pollCtx, pollCancel := context.WithCancel(context.Background())
-		go func() {
-			if err := client.Start(pollCtx); err != nil && pollCtx.Err() == nil {
-				logger.Errorf(context.Background(), "[IM] WeChat long-poll stopped for channel %s: %v", channel.ID, err)
-			}
-		}()
-
-		return adapter, pollCancel, nil
-	})
+	imService.RegisterAdapterFactory("wecom", wecom.NewFactory())
+	imService.RegisterAdapterFactory("feishu", feishu.NewFactory())
+	imService.RegisterAdapterFactory("slack", slack.NewFactory())
+	imService.RegisterAdapterFactory("telegram", telegram.NewFactory())
+	imService.RegisterAdapterFactory("dingtalk", dingtalk.NewFactory())
+	imService.RegisterAdapterFactory("mattermost", mattermost.NewFactory())
+	imService.RegisterAdapterFactory("wechat", wechat.NewFactory())
 
 	// Load and start all enabled channels from database
 	if err := imService.LoadAndStartChannels(); err != nil {
-		logger.Warnf(ctx, "[IM] Failed to load channels from database: %v", err)
-	}
-}
-
-// parseCredentials parses the JSONB credentials field into a map.
-func parseCredentials(data []byte) (map[string]interface{}, error) {
-	if len(data) == 0 {
-		return map[string]interface{}{}, nil
-	}
-	var creds map[string]interface{}
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return nil, err
-	}
-	return creds, nil
-}
-
-// getString safely extracts a string value from a credentials map.
-func getString(creds map[string]interface{}, key string) string {
-	if v, ok := creds[key]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	return ""
-}
-
-// credentialBool reads a boolean from JSON credentials (bool, string "true"/"1", or non-zero number).
-func credentialBool(creds map[string]interface{}, key string) bool {
-	v, ok := creds[key]
-	if !ok {
-		return false
-	}
-	switch x := v.(type) {
-	case bool:
-		return x
-	case string:
-		s := strings.TrimSpace(strings.ToLower(x))
-		return s == "true" || s == "1" || s == "yes"
-	case float64:
-		return x != 0
-	case int:
-		return x != 0
-	default:
-		return false
+		logger.Warnf(context.Background(), "[IM] Failed to load channels from database: %v", err)
 	}
 }
 
 // initConnectorRegistry creates and populates the connector registry with all available connectors.
-func initConnectorRegistry() *datasource.ConnectorRegistry {
+// Aggregates registration errors via errors.Join so a misconfigured or duplicated connector fails
+// container initialization loudly instead of silently disabling the feature at runtime.
+func initConnectorRegistry() (*datasource.ConnectorRegistry, error) {
 	registry := datasource.NewConnectorRegistry()
 
-	// Register Feishu connector
-	_ = registry.Register(feishuConnector.NewConnector())
-
-	// Register Notion connector
-	_ = registry.Register(notionConnector.NewConnector())
-
-	// Register Yuque connector
-	_ = registry.Register(yuqueConnector.NewConnector())
+	var errs error
+	if err := registry.Register(feishuConnector.NewConnector()); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("register feishu connector: %w", err))
+	}
+	if err := registry.Register(notionConnector.NewConnector()); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("register notion connector: %w", err))
+	}
+	if err := registry.Register(yuqueConnector.NewConnector()); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("register yuque connector: %w", err))
+	}
 
 	// Future connectors will be registered here:
-	// _ = registry.Register(confluenceConnector.NewConnector())
-	// _ = registry.Register(githubConnector.NewConnector())
+	// if err := registry.Register(confluenceConnector.NewConnector()); err != nil { ... }
+	// if err := registry.Register(githubConnector.NewConnector()); err != nil { ... }
 
-	return registry
+	if errs != nil {
+		return nil, errs
+	}
+	return registry, nil
 }
 
 // startDataSourceScheduler starts the data source cron scheduler and registers cleanup.
